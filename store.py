@@ -41,6 +41,7 @@ Variáveis de ambiente (opcional, para throughput de backfill)::
     STORE_VERIFY_TS_COL=local_ts   # ou timestamp se a tabela tiver essa coluna designada
     STORE_STREAM_RETRY_BASE_SEC=2    # backoff após erro WS / rede
     STORE_STREAM_RETRY_MAX_SEC=120
+    STORE_TICK_TRADES_DEDUP_KEYS=500000   # LRU de (symbol_id, trade_id) antes do ILP — evita duplicados por replay WS
     QUESTDB_HTTP_URL=http://127.0.0.1:9000   # /exec para listar ``symbols`` e registry (obrigatório se ILP for tcp::…)
 
 Cria a tabela ``symbols`` e fact tables com ``symbol_id`` — vê ``questdb_schema_symbols.sql``.
@@ -60,6 +61,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -99,6 +101,35 @@ def _env_truthy(name: str, default: bool = False) -> bool:
     if raw is None or raw.strip() == "":
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+class _TickTradeDedup:
+    """
+    Evita inserir o mesmo (symbol_id, trade_id) duas vezes (replay do WebSocket / reconexão).
+
+    Mantém um LRU de chaves já enviadas com sucesso e um conjunto de chaves em voo para não
+    duplicar enquanto o ``await`` do ILP está pendente. A eviction só remove entradas *committed*.
+    """
+
+    def __init__(self, max_committed: int) -> None:
+        self._max = max(10_000, int(max_committed))
+        self._committed: OrderedDict[tuple[int, str], None] = OrderedDict()
+        self._inflight: set[tuple[int, str]] = set()
+
+    def try_begin(self, key: tuple[int, str]) -> bool:
+        if key in self._committed or key in self._inflight:
+            return False
+        self._inflight.add(key)
+        return True
+
+    def finish(self, key: tuple[int, str], *, success: bool) -> None:
+        self._inflight.discard(key)
+        if not success:
+            return
+        self._committed[key] = None
+        self._committed.move_to_end(key)
+        while len(self._committed) > self._max:
+            self._committed.popitem(last=False)
 
 
 def _env_max_stale_override(param: float | None) -> float | None:
@@ -858,6 +889,8 @@ async def run_store(
     registry = _SymbolRegistry(http_base)
     await registry.warm(sym_list)
     lock = asyncio.Lock()
+    tick_dedup = _TickTradeDedup(_env_int("STORE_TICK_TRADES_DEDUP_KEYS", 500_000))
+    tick_dedup_lock = asyncio.Lock()
 
     async def send_row(
         sender: Sender,
@@ -866,7 +899,7 @@ async def run_store(
         symbols_kw: dict[str, Any] | None,
         columns: dict[str, Any],
         at: TimestampNanos | datetime,
-    ) -> None:
+    ) -> bool:
         cols = _clean_columns(columns)
         syms: dict[str, str] = {}
         if symbols_kw:
@@ -883,39 +916,61 @@ async def run_store(
                     columns=cols,
                     at=at,
                 )
+                return True
             except IngressError as e:
                 log.error("QuestDB rejeitou linha em %s: %s", table, e)
             except Exception:
                 log.exception("Falha ao escrever em %s", table)
+        return False
 
     async def pump_tick_trades(sender: Sender, sym: str) -> None:
         async def handle(t: dict[str, Any]) -> None:
-            tid = t.get("trade_id")
+            tid_raw = t.get("trade_id")
+            if not tid_raw:
+                return
+            tid = str(tid_raw).strip()
             if not tid:
                 return
             ns = t.get("local_ts_ns")
             if not isinstance(ns, int):
                 return
+            try:
+                price = float(t["price"])
+                amount = float(t["amount"])
+            except (KeyError, TypeError, ValueError):
+                return
+            if price <= 0 or amount < 0:
+                return
             sid = await registry.id_for(t.get("symbol"))
             if sid is None:
                 return
+            dedup_key = (sid, tid)
+            async with tick_dedup_lock:
+                if not tick_dedup.try_begin(dedup_key):
+                    log.debug("tick_trades dedup skip sid=%s trade_id=%s", sid, tid)
+                    return
             skw: dict[str, Any] | None = {"side": t.get("side")} if t.get("side") else None
             columns: dict[str, Any] = {
                 "symbol_id": sid,
-                "trade_id": str(tid),
-                "price": float(t["price"]),
-                "amount": float(t["amount"]),
+                "trade_id": tid,
+                "price": price,
+                "amount": amount,
                 "exchange_ts": _dt_utc_ms(t.get("exchange_ts")),
                 "local_ts": _dt_utc_ms(t.get("local_ts")),
                 "stream_batch_index": t.get("stream_batch_index"),
             }
-            await send_row(
-                sender,
-                "tick_trades",
-                symbols_kw=skw,
-                columns=columns,
-                at=TimestampNanos(ns),
-            )
+            ok = False
+            try:
+                ok = await send_row(
+                    sender,
+                    "tick_trades",
+                    symbols_kw=skw,
+                    columns=columns,
+                    at=TimestampNanos(ns),
+                )
+            finally:
+                async with tick_dedup_lock:
+                    tick_dedup.finish(dedup_key, success=ok)
 
         await _stream_loop(
             f"tick_trades[{sym}]",
