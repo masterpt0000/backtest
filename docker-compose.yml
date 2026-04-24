@@ -1,0 +1,17 @@
+# PostgreSQL para dados de aplicação (estratégias, jobs, parâmetros).
+# QuestDB continua separado (velas). Subir só Postgres: docker compose up -d postgres
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: backtest-postgres
+    environment:
+      POSTGRES_USER: backtest
+      POSTGRES_PASSWORD: backtest
+      POSTGRES_DB: backtest_app
+    ports:
+      - "5433:5432"
+    volumes:
+      - backtest_pg_data:/var/lib/postgresql/data
+
+volumes:
+  backtest_pg_data:

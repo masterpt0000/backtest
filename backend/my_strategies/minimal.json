@@ -1,0 +1,20 @@
+{
+  "id": "minimal",
+  "name": "Mínima",
+  "indicators": [
+    {
+      "id": "ema21",
+      "label": "EMA 21",
+      "group": "overlays",
+      "kind": "ema",
+      "params": { "period": 21 }
+    },
+    {
+      "id": "rsi",
+      "label": "RSI (14)",
+      "group": "studies",
+      "kind": "rsi",
+      "params": { "period": 14 }
+    }
+  ]
+}

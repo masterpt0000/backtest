@@ -1,0 +1,13 @@
+{
+  "id": "exemplo",
+  "name": "Copia para novo_ficheiro.json (sem o _ no início)",
+  "indicators": [
+    {
+      "id": "ema20",
+      "label": "EMA 20",
+      "group": "overlays",
+      "kind": "ema",
+      "params": { "period": 20 }
+    }
+  ]
+}

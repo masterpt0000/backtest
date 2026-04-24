@@ -1,0 +1,34 @@
+{
+  "id": "classic",
+  "name": "Clássica",
+  "indicators": [
+    {
+      "id": "ema8",
+      "label": "EMA 8",
+      "group": "overlays",
+      "kind": "ema",
+      "params": { "period": 8 }
+    },
+    {
+      "id": "ema21",
+      "label": "EMA 21",
+      "group": "overlays",
+      "kind": "ema",
+      "params": { "period": 21 }
+    },
+    {
+      "id": "bb",
+      "label": "Bollinger",
+      "group": "overlays",
+      "kind": "bollinger",
+      "params": { "period": 20, "mult": 2 }
+    },
+    {
+      "id": "rsi",
+      "label": "RSI (14)",
+      "group": "studies",
+      "kind": "rsi",
+      "params": { "period": 14 }
+    }
+  ]
+}

@@ -2,8 +2,16 @@
 Corre todos os streams de ``get_data`` e grava em QuestDB via ILP (``questdb``).
 
 **Verificar dados:** com o store a correr, por defeito corre **de hora em hora** (``STORE_VERIFY_INTERVAL_SEC=3600``).
-Também: ``python store.py --verify`` ou ``verify_store_data()`` — contagens, duplicados em ``trade_id``,
-gaps em ``candles_1m`` e staleness. ``STORE_VERIFY_INTERVAL_SEC=0`` desliga a verificação automática.
+Também: ``python store.py --verify`` — só consulta a QuestDB e sai (código 2 se houver problemas).
+``python store.py --verify --auto-repair`` — se falhar, executa ``repair_tick_trades`` com apply e volta a verificar.
+``--no-auto-repair`` numa corrida ignora ``STORE_VERIFY_AUTO_REPAIR`` no ambiente.
+No processo longo: ``STORE_VERIFY_AUTO_REPAIR=1`` faz o mesmo após cada verificação automática com falhas.
+
+**Reparar ``tick_trades``:** ``python store.py --repair-tick-trades`` (só mostra contagens e amostras).
+``python store.py --repair-tick-trades --apply`` remove linhas **irrecuperáveis** (sem ``trade_id`` válido,
+preço/amount inválidos) e **duplicados** do mesmo ``(symbol_id, trade_id)``, mantendo uma linha pelo
+timestamp de linha QuestDB (``timestamp`` do ILP; override: ``REPAIR_TICK_TRADES_ROW_TS_COL``).
+Opções: ``--lookback-hours=24``, ``--keep=newest|oldest``. Não inventa IDs nem preços da Binance.
 
 **Vários símbolos (por defeito):** insere os pares CCXT na tabela QuestDB ``symbols`` (coluna ``code``);
 o ``store.py`` faz ``SELECT DISTINCT code FROM symbols`` e arranca um stream por código.
@@ -25,8 +33,14 @@ Variáveis de ambiente (opcional, para throughput de backfill)::
     STORE_AUTO_FLUSH_INTERVAL_NS=1000000000
     STORE_HEARTBEAT_SEC=600
     STORE_VERIFY_INTERVAL_SEC=3600   # 0 = só manual (--verify / verify_store_data)
+    STORE_VERIFY_AUTO_REPAIR=0       # 1 = após verify com falhas, repair tick_trades + verify outra vez
+    STORE_VERIFY_REPAIR_KEEP=newest  # ou oldest (duplicados)
+    STORE_VERIFY_REPAIR_LOOKBACK_HOURS=   # vazio = igual a STORE_VERIFY_LOOKBACK_HOURS no repair
     STORE_VERIFY_LOOKBACK_HOURS=24
-    STORE_VERIFY_TS_COL=timestamp   # se o DDL usar outro nome de coluna de tempo
+    STORE_VERIFY_MAX_STALE_SEC=300   # ou none/off/disable para não falhar por atraso
+    STORE_VERIFY_TS_COL=local_ts   # ou timestamp se a tabela tiver essa coluna designada
+    STORE_STREAM_RETRY_BASE_SEC=2    # backoff após erro WS / rede
+    STORE_STREAM_RETRY_MAX_SEC=120
     QUESTDB_HTTP_URL=http://127.0.0.1:9000   # /exec para listar ``symbols`` e registry (obrigatório se ILP for tcp::…)
 
 Cria a tabela ``symbols`` e fact tables com ``symbol_id`` — vê ``questdb_schema_symbols.sql``.
@@ -48,7 +62,8 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any, TypeVar
 
 from questdb.ingress import IngressError, Sender, TimestampNanos  # type: ignore[reportMissingModuleSource]
 
@@ -62,6 +77,7 @@ _DEFAULT_FLUSH_ROWS = 2000
 _DEFAULT_FLUSH_INTERVAL_NS = 1_000_000_000
 _DEFAULT_HEARTBEAT_SEC = 600
 _DEFAULT_VERIFY_INTERVAL_SEC = 3600
+_DEFAULT_VERIFY_TS_COL = "local_ts"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -76,6 +92,24 @@ def _env_float(name: str, default: float) -> float:
     if raw is None or raw.strip() == "":
         return default
     return float(raw)
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_max_stale_override(param: float | None) -> float | None:
+    """``STORE_VERIFY_MAX_STALE_SEC``: número de segundos, ou ``none``/``off``/``disable`` para desligar."""
+    raw = os.environ.get("STORE_VERIFY_MAX_STALE_SEC")
+    if raw is None or raw.strip() == "":
+        return param
+    s = raw.strip().lower()
+    if s in ("none", "off", "disable"):
+        return None
+    return float(raw.strip())
 
 
 def _fetch_symbol_codes_from_questdb(http_base: str) -> list[str]:
@@ -175,7 +209,10 @@ def _exec_sql(http_base: str, query: str, *, timeout: float = 60.0) -> dict[str,
     url = exec_base + "?" + urllib.parse.urlencode({"query": query})
     req = urllib.request.Request(url, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+        raw = resp.read().decode().strip()
+        if not raw:
+            return {}
+        return json.loads(raw)
 
 
 class _SymbolRegistry:
@@ -272,6 +309,43 @@ def _clean_columns(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
 
 
+_T = TypeVar("_T")
+
+
+async def _stream_loop(
+    tag: str,
+    factory: Callable[[], AsyncIterator[_T]],
+    handle: Callable[[_T], Awaitable[None]],
+) -> None:
+    """
+    Consome um async generator (CCXT / WebSocket) e volta a ligar com backoff
+    após ``NetworkError`` (ex. código 1006) ou outras falhas transitórias.
+    """
+    base = _env_float("STORE_STREAM_RETRY_BASE_SEC", 2.0)
+    cap = _env_float("STORE_STREAM_RETRY_MAX_SEC", 120.0)
+    delay = base
+    while True:
+        try:
+            async for item in factory():
+                delay = base
+                await handle(item)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(
+                "%s: %s — %s; nova tentativa em %.1fs",
+                tag,
+                type(e).__name__,
+                e,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(cap, delay * 2)
+            continue
+        log.warning("%s: stream terminou — a reiniciar em %.1fs", tag, base)
+        await asyncio.sleep(base)
+
+
 _STORE_FACT_TABLES: tuple[str, ...] = (
     "tick_trades",
     "mark_price_funding",
@@ -292,7 +366,21 @@ def _validate_ts_column(name: str) -> str:
 def _sql_since_hours(hours: float) -> str:
     if hours <= 0:
         raise ValueError("lookback_hours deve ser > 0")
-    return f"dateadd('h', {-float(hours)}, now())"
+    h = float(hours)
+    # QuestDB rejeita por vezes ``-24.0`` no dateadd; usar inteiro quando for caso.
+    neg = -int(h) if h == int(h) else -h
+    return f"dateadd('h', {neg}, now())"
+
+
+def _http_error_detail(e: urllib.error.HTTPError, *, max_len: int = 450) -> str:
+    """Corpo JSON/texto da resposta (QuestDB costuma explicar o 400 aqui)."""
+    try:
+        raw = e.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        return (e.reason or "").strip()
+    if len(raw) > max_len:
+        return raw[:max_len] + "…"
+    return raw or (e.reason or "").strip()
 
 
 def _dataset_rows(resp: dict[str, Any]) -> list[list[Any]]:
@@ -355,16 +443,23 @@ def verify_store_data(
     - **candles_1m:** intervalos entre velas consecutivas (por ``symbol_id``) acima de ``candle_gap_sec``
       (esperado ~60 s; tolerância para atrasos da exchange).
 
-    **Coluna de tempo:** por defeito ``timestamp`` (tabelas criadas só por ILP). Se o DDL usar outro nome
-    (ex. ``local_ts_ns``), passa ``ts_col=...`` ou define ``STORE_VERIFY_TS_COL``.
+    **Coluna de tempo:** por defeito ``local_ts`` (como no ILP do ``store``). Define
+    ``STORE_VERIFY_TS_COL=timestamp`` se as fact tables usarem essa coluna.
 
     **Lookback:** env ``STORE_VERIFY_LOOKBACK_HOURS`` ou argumento (default 24).
+
+    **Staleness:** env ``STORE_VERIFY_MAX_STALE_SEC`` (sobrepõe ``max_stale_sec``) ou ``none`` para desligar.
     """
     lb = lookback_hours
     if lb is None:
         lb = _env_float("STORE_VERIFY_LOOKBACK_HOURS", 24.0)
+    stale_limit = _env_max_stale_override(max_stale_sec)
     col = _validate_ts_column(
-        (ts_col or os.environ.get("STORE_VERIFY_TS_COL") or "timestamp").strip()
+        (
+            ts_col
+            or os.environ.get("STORE_VERIFY_TS_COL")
+            or _DEFAULT_VERIFY_TS_COL
+        ).strip()
     )
     issues: list[str] = []
     warnings: list[str] = []
@@ -380,50 +475,76 @@ def verify_store_data(
     id_to_code = _fetch_symbol_id_to_code(base)
 
     for tbl in _STORE_FACT_TABLES:
-        q = (
-            f"SELECT count(), max({col}), date_diff('s', max({col}), now()) "
-            f"FROM {tbl} WHERE {col} >= {since}"
-        )
+        q_count = f"SELECT count() FROM {tbl} WHERE {col} >= {since}"
         try:
-            r = _exec_sql(base, q)
+            r_count = _exec_sql(base, q_count)
         except urllib.error.HTTPError as e:
-            warnings.append(f"{tbl}: HTTP {e.code} ao contar (tabela existe?)")
+            detail = _http_error_detail(e)
+            warnings.append(
+                f"{tbl}: HTTP {e.code} ao contar — {detail or 'sem detalhe'}"
+            )
             continue
         except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError) as e:
             warnings.append(f"{tbl}: falha na query ({type(e).__name__}: {e})")
             continue
-        rows = _dataset_rows(r)
-        if not rows or not rows[0]:
+        rows_c = _dataset_rows(r_count)
+        if not rows_c or not rows_c[0]:
             tables_out[tbl] = {"rows": 0, "max_ts": None, "stale_sec": None}
-            warnings.append(f"{tbl}: resposta vazia ou sem linhas agregadas")
+            warnings.append(f"{tbl}: resposta vazia ao contar")
             continue
-        crow = rows[0]
-        n = int(crow[0]) if crow[0] is not None else 0
-        max_ts = crow[1]
-        stale_sec = crow[2]
+        n = int(rows_c[0][0]) if rows_c[0][0] is not None else 0
+        if n == 0:
+            tables_out[tbl] = {"rows": 0, "max_ts": None, "stale_sec": None}
+            warnings.append(f"{tbl}: sem dados na janela ({lb} h)")
+            continue
+
+        # Subquery evita agregados aninhados; QuestDB usa ``datediff`` (não ``date_diff``).
+        q_stale = (
+            f"SELECT m, datediff('s', m, now()) FROM ("
+            f"SELECT max({col}) AS m FROM {tbl} WHERE {col} >= {since}"
+            f")"
+        )
+        try:
+            r_stale = _exec_sql(base, q_stale)
+        except urllib.error.HTTPError as e:
+            detail = _http_error_detail(e)
+            warnings.append(
+                f"{tbl}: HTTP {e.code} ao ler max/stale — {detail or 'sem detalhe'}"
+            )
+            tables_out[tbl] = {"rows": n, "max_ts": None, "stale_sec": None}
+            continue
+        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError) as e:
+            warnings.append(f"{tbl}: falha na query max/stale ({type(e).__name__}: {e})")
+            tables_out[tbl] = {"rows": n, "max_ts": None, "stale_sec": None}
+            continue
+        rows_s = _dataset_rows(r_stale)
+        if not rows_s or not rows_s[0]:
+            tables_out[tbl] = {"rows": n, "max_ts": None, "stale_sec": None}
+            warnings.append(f"{tbl}: resposta vazia em max/stale")
+            continue
+        crow = rows_s[0]
+        max_ts = crow[0]
+        stale_sec = crow[1]
         tables_out[tbl] = {
             "rows": n,
             "max_ts": max_ts,
             "stale_sec": float(stale_sec) if stale_sec is not None else None,
         }
-        if n == 0:
-            warnings.append(f"{tbl}: sem dados na janela ({lb} h)")
-        elif max_stale_sec is not None and stale_sec is not None:
-            if float(stale_sec) > float(max_stale_sec):
+        if stale_limit is not None and stale_sec is not None:
+            if float(stale_sec) > float(stale_limit):
                 issues.append(
                     f"{tbl}: dados parados — último ponto há {stale_sec:.0f}s "
-                    f"(limite {max_stale_sec:.0f}s)"
+                    f"(limite {stale_limit:.0f}s)"
                 )
 
-    # Duplicados trade_id
+    # Duplicados trade_id — QuestDB costuma rejeitar HAVING dentro desta subquery; usar WHERE exterior.
     try:
         qdup = (
             f"SELECT count() FROM ( "
-            f"SELECT symbol_id, trade_id FROM tick_trades "
+            f"SELECT symbol_id, trade_id, count() AS n FROM tick_trades "
             f"WHERE {col} >= {since} "
             f"GROUP BY symbol_id, trade_id "
-            f"HAVING count() > 1 "
-            f") dups"
+            f") t WHERE t.n > 1"
         )
         rdup = _exec_sql(base, qdup)
         dr = _dataset_rows(rdup)
@@ -433,7 +554,11 @@ def verify_store_data(
                 issues.append(
                     f"tick_trades: {dup_groups} pares (symbol_id, trade_id) com linhas duplicadas"
                 )
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, ValueError) as e:
+    except urllib.error.HTTPError as e:
+        warnings.append(
+            f"tick_trades duplicados: HTTP {e.code} — {_http_error_detail(e)}"
+        )
+    except (urllib.error.URLError, json.JSONDecodeError, ValueError) as e:
         warnings.append(f"tick_trades duplicados: não verificado ({e})")
 
     # Ticks inválidos
@@ -450,7 +575,11 @@ def verify_store_data(
             invalid_ticks = int(br[0][0])
             if invalid_ticks > 0:
                 issues.append(f"tick_trades: {invalid_ticks} linhas com trade_id/preço/amount inválidos")
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, ValueError) as e:
+    except urllib.error.HTTPError as e:
+        warnings.append(
+            f"tick_trades inválidos: HTTP {e.code} — {_http_error_detail(e)}"
+        )
+    except (urllib.error.URLError, json.JSONDecodeError, ValueError) as e:
         warnings.append(f"tick_trades inválidos: não verificado ({e})")
 
     # Gaps em velas 1m (requer LAG no QuestDB recente)
@@ -459,13 +588,13 @@ def verify_store_data(
     try:
         qgap = (
             f"SELECT symbol_id, prev_ts, ts, gap_sec FROM ( "
-            f"SELECT symbol_id, prev_ts, ts, date_diff('s', prev_ts, ts) AS gap_sec "
+            f"SELECT symbol_id, prev_ts, ts, datediff('s', prev_ts, ts) AS gap_sec "
             f"FROM ( "
             f"SELECT symbol_id, {col} AS ts, "
             f"lag({col}) OVER (PARTITION BY symbol_id ORDER BY {col}) AS prev_ts "
             f"FROM candles_1m WHERE {col} >= {since} "
             f") "
-            f"WHERE prev_ts IS NOT NULL AND date_diff('s', prev_ts, ts) > {cg} "
+            f"WHERE prev_ts IS NOT NULL AND datediff('s', prev_ts, ts) > {cg} "
             f") LIMIT {lim}"
         )
         rgap = _exec_sql(base, qgap)
@@ -487,9 +616,18 @@ def verify_store_data(
                 f"candles_1m: {len(candle_gaps)} gap(s) > {cg:.0f}s "
                 f"(mostrando até {lim}; consecutivas podem ser várias por buraco)"
             )
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, ValueError) as e:
+    except urllib.error.HTTPError as e:
+        warnings.append(
+            f"candles_1m gaps: HTTP {e.code} — {_http_error_detail(e)}"
+        )
+    except (urllib.error.URLError, json.JSONDecodeError, ValueError) as e:
         warnings.append(f"candles_1m gaps: não verificado — {type(e).__name__}: {e}")
 
+    if len(issues) == 0 and not tables_out and warnings:
+        issues.append(
+            "Verificação incompleta: nenhuma tabela fact foi consultada com sucesso; "
+            "vê os avisos com HTTP/SQL (antes o relatório podia mostrar ok=True sem dados)."
+        )
     ok = len(issues) == 0
     return StoreHealthReport(
         ok=ok,
@@ -536,6 +674,179 @@ def log_store_health_report(rep: StoreHealthReport) -> None:
         log.error("  ... e mais %s gap(s)", len(rep.candle_gaps) - 20)
 
 
+def _tick_trades_row_timestamp_column(http_base: str) -> str:
+    """Coluna de tempo de linha do ILP (``at=``), por defeito ``timestamp`` — não ``local_ts``."""
+    override = os.environ.get("REPAIR_TICK_TRADES_ROW_TS_COL", "").strip()
+    if override:
+        return _validate_ts_column(override)
+    r = _exec_sql(http_base, "SELECT * FROM tick_trades LIMIT 1")
+    parsed: list[tuple[str, str]] = []
+    for c in r.get("columns") or []:
+        if isinstance(c, dict):
+            nm = str(c.get("name") or "")
+            typ = (c.get("type") or "").upper()
+        else:
+            nm = str(c[0]) if c else ""
+            typ = str(c[1] if len(c) > 1 else "").upper()
+        if nm:
+            parsed.append((nm, typ))
+    for nm, _ in parsed:
+        if nm == "timestamp":
+            return nm
+    for nm, typ in parsed:
+        if "TIMESTAMP" in typ and nm != "local_ts":
+            return _validate_ts_column(nm)
+    raise ValueError(
+        "Não detetei coluna de timestamp de linha em tick_trades; define REPAIR_TICK_TRADES_ROW_TS_COL."
+    )
+
+
+def _sql_timestamp_literal(v: Any) -> str:
+    if isinstance(v, (int, float)):
+        return str(int(v))
+    s = str(v).strip()
+    return "'" + _escape_sql_literal(s) + "'"
+
+
+def _invalid_tick_trades_predicate() -> str:
+    return (
+        "( trade_id IS NULL OR trade_id = '' OR price IS NULL OR price <= 0 "
+        "OR amount IS NULL OR amount < 0 )"
+    )
+
+
+def repair_tick_trades_questdb(
+    *,
+    http_base: str | None = None,
+    qdb_conf: str | None = None,
+    lookback_hours: float | None = None,
+    dry_run: bool = True,
+    keep: str = "newest",
+) -> dict[str, int]:
+    """
+    - **Linhas inválidas:** as mesmas condições que ``verify_store_data`` (+ ``trade_id`` vazio).
+      Só **DELETE** — não há como preencher trade_id/preço real sem a API da exchange.
+    - **Duplicados:** mesmo ``(symbol_id, trade_id)`` com várias linhas; mantém **newest** ou **oldest**
+      pelo ``timestamp`` de linha QuestDB; apaga as outras.
+    """
+    lb = lookback_hours if lookback_hours is not None else _env_float("STORE_VERIFY_LOOKBACK_HOURS", 24.0)
+    conf = (qdb_conf or os.environ.get("QDB_CLIENT_CONF") or DEFAULT_QDB_CONF).strip()
+    base = (http_base or _resolve_questdb_http_base(ilp_conf=conf)).rstrip("/")
+    filter_col = _validate_ts_column(
+        (os.environ.get("STORE_VERIFY_TS_COL") or _DEFAULT_VERIFY_TS_COL).strip(),
+    )
+    since = _sql_since_hours(lb)
+    row_ts = _tick_trades_row_timestamp_column(base)
+    pred_bad = _invalid_tick_trades_predicate()
+    stats = {"invalid_deleted": 0, "dup_rows_deleted": 0, "dup_groups": 0}
+
+    q_count_bad = (
+        f"SELECT count() FROM tick_trades WHERE {filter_col} >= {since} AND {pred_bad}"
+    )
+    n_bad = 0
+    try:
+        cr = _exec_sql(base, q_count_bad)
+        dr = _dataset_rows(cr)
+        if dr and dr[0] and dr[0][0] is not None:
+            n_bad = int(dr[0][0])
+    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError, ValueError, OSError) as e:
+        log.error("Contagem linhas inválidas: %s", e)
+        return stats
+
+    if n_bad > 0:
+        q_sample = (
+            f"SELECT symbol_id, trade_id, price, amount, {filter_col} FROM tick_trades "
+            f"WHERE {filter_col} >= {since} AND {pred_bad} LIMIT 15"
+        )
+        try:
+            sr = _exec_sql(base, q_sample)
+            log.info("Amostra de linhas inválidas (até 15): %s", _dataset_rows(sr))
+        except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError, ValueError, OSError):
+            log.warning("Não foi possível obter amostra de inválidas.")
+
+    if not dry_run and n_bad > 0:
+        del_bad = f"DELETE FROM tick_trades WHERE {filter_col} >= {since} AND {pred_bad}"
+        try:
+            _exec_sql(base, del_bad)
+            stats["invalid_deleted"] = n_bad
+            log.info("Removidas %s linhas inválidas em tick_trades (janela %.2f h).", n_bad, lb)
+        except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError, ValueError, OSError) as e:
+            log.error("DELETE inválidas falhou: %s", e)
+
+    q_dup_keys = (
+        f"SELECT symbol_id, trade_id FROM ( "
+        f"SELECT symbol_id, trade_id, count() AS n FROM tick_trades "
+        f"WHERE {filter_col} >= {since} "
+        f"GROUP BY symbol_id, trade_id "
+        f") t WHERE t.n > 1"
+    )
+    try:
+        kr = _exec_sql(base, q_dup_keys)
+        keys = _dataset_rows(kr)
+    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError, ValueError, OSError) as e:
+        log.error("Lista de duplicados: %s", e)
+        return stats
+
+    keep_newest = keep.strip().lower() != "oldest"
+    order = "DESC" if keep_newest else "ASC"
+
+    for row in keys:
+        if len(row) < 2 or row[0] is None or row[1] is None:
+            continue
+        sid = int(row[0])
+        tid = str(row[1])
+        esc = _escape_sql_literal(tid)
+        q_ts = (
+            f"SELECT {row_ts} FROM tick_trades WHERE symbol_id = {sid} "
+            f"AND trade_id = '{esc}' AND {filter_col} >= {since} "
+            f"ORDER BY {row_ts} {order}"
+        )
+        try:
+            tr = _exec_sql(base, q_ts)
+            trows = _dataset_rows(tr)
+        except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError, ValueError, OSError) as e:
+            log.warning("symbol_id=%s trade_id=%s: ler timestamps falhou: %s", sid, tid, e)
+            continue
+        if len(trows) <= 1:
+            continue
+        stats["dup_groups"] += 1
+        ts_vals = [r[0] for r in trows if r and r[0] is not None]
+        if len(ts_vals) <= 1:
+            continue
+        to_drop = ts_vals[1:]
+        log.info(
+            "Duplicado symbol_id=%s trade_id=%s: %s linhas; manter %s; remover %s timestamp(s).",
+            sid,
+            tid,
+            len(ts_vals),
+            ts_vals[0],
+            len(to_drop),
+        )
+        if dry_run:
+            continue
+        for tv in to_drop:
+            lit = _sql_timestamp_literal(tv)
+            dq = (
+                f"DELETE FROM tick_trades WHERE symbol_id = {sid} "
+                f"AND trade_id = '{esc}' AND {row_ts} = {lit}"
+            )
+            try:
+                _exec_sql(base, dq)
+                stats["dup_rows_deleted"] += 1
+            except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError, ValueError, OSError) as e:
+                log.warning("DELETE dup falhou sid=%s tid=%s ts=%s: %s", sid, tid, tv, e)
+
+    if dry_run:
+        log.info(
+            "[dry-run] tick_trades: %s inválidas na janela; %s grupos (symbol_id, trade_id) duplicados.",
+            n_bad,
+            stats["dup_groups"],
+        )
+        log.info("Repete com --apply para executar DELETEs (ou define --keep=oldest).")
+
+    return stats
+
+
 async def run_store(
     *,
     qdb_conf: str | None = None,
@@ -578,16 +889,16 @@ async def run_store(
                 log.exception("Falha ao escrever em %s", table)
 
     async def pump_tick_trades(sender: Sender, sym: str) -> None:
-        async for t in gd.tick_trades(symbol=sym):
+        async def handle(t: dict[str, Any]) -> None:
             tid = t.get("trade_id")
             if not tid:
-                continue
+                return
             ns = t.get("local_ts_ns")
             if not isinstance(ns, int):
-                continue
+                return
             sid = await registry.id_for(t.get("symbol"))
             if sid is None:
-                continue
+                return
             skw: dict[str, Any] | None = {"side": t.get("side")} if t.get("side") else None
             columns: dict[str, Any] = {
                 "symbol_id": sid,
@@ -606,14 +917,20 @@ async def run_store(
                 at=TimestampNanos(ns),
             )
 
+        await _stream_loop(
+            f"tick_trades[{sym}]",
+            lambda: gd.tick_trades(symbol=sym),
+            handle,
+        )
+
     async def pump_mark_funding(sender: Sender, sym: str) -> None:
-        async for row in gd.mark_price_funding(symbol=sym):
+        async def handle(row: dict[str, Any]) -> None:
             lt = row.get("local_ts")
             if not isinstance(lt, int):
-                continue
+                return
             sid = await registry.id_for(row.get("symbol"))
             if sid is None:
-                continue
+                return
             columns: dict[str, Any] = {
                 "symbol_id": sid,
                 "local_ts": _dt_utc_ms(lt),
@@ -631,17 +948,23 @@ async def run_store(
                 at=TimestampNanos(int(lt) * 1_000_000),
             )
 
+        await _stream_loop(
+            f"mark_price_funding[{sym}]",
+            lambda: gd.mark_price_funding(symbol=sym),
+            handle,
+        )
+
     async def pump_open_interest(sender: Sender, sym: str) -> None:
-        async for row in gd.open_interest_poll(symbol=sym):
+        async def handle(row: dict[str, Any]) -> None:
             lt = row.get("local_ts")
             if not isinstance(lt, int):
-                continue
+                return
             oi = row.get("open_interest_amount")
             if oi is None:
-                continue
+                return
             sid = await registry.id_for(row.get("symbol"))
             if sid is None:
-                continue
+                return
             columns: dict[str, Any] = {
                 "symbol_id": sid,
                 "local_ts": _dt_utc_ms(lt),
@@ -656,20 +979,26 @@ async def run_store(
                 at=TimestampNanos(int(lt) * 1_000_000),
             )
 
+        await _stream_loop(
+            f"open_interest[{sym}]",
+            lambda: gd.open_interest_poll(symbol=sym),
+            handle,
+        )
+
     async def pump_order_book(sender: Sender, sym: str) -> None:
-        async for snap in gd.order_book_snapshots(symbol=sym):
+        async def handle(snap: dict[str, Any]) -> None:
             lt = snap.get("local_ts")
             if not isinstance(lt, int):
-                continue
+                return
             bids = snap.get("bids") or []
             asks = snap.get("asks") or []
             m = _order_book_metrics(bids, asks)
             if m is None:
-                continue
+                return
             bb, ba, spread, bd, ad, n_b, n_a = m
             sid = await registry.id_for(snap.get("symbol"))
             if sid is None:
-                continue
+                return
             columns: dict[str, Any] = {
                 "symbol_id": sid,
                 "local_ts": _dt_utc_ms(lt),
@@ -690,21 +1019,28 @@ async def run_store(
                 at=TimestampNanos(int(lt) * 1_000_000),
             )
 
+        await _stream_loop(
+            f"order_book[{sym}]",
+            lambda: gd.order_book_snapshots(symbol=sym),
+            handle,
+        )
+
     async def pump_liquidations_all(sender: Sender) -> None:
-        if len(sym_list) == 1:
-            stream = gd.liquidation_events(symbol=sym_list[0])
-        else:
-            stream = gd.liquidation_events(symbols=list(sym_list))
-        async for ev in stream:
+        def liq_factory() -> AsyncIterator[dict[str, Any]]:
+            if len(sym_list) == 1:
+                return gd.liquidation_events(symbol=sym_list[0])
+            return gd.liquidation_events(symbols=list(sym_list))
+
+        async def handle(ev: dict[str, Any]) -> None:
             lt = ev.get("local_ts")
             if not isinstance(lt, int):
-                continue
+                return
             lid = ev.get("liquidation_event_id")
             if not lid:
-                continue
+                return
             sid = await registry.id_for(ev.get("symbol"))
             if sid is None:
-                continue
+                return
             skw: dict[str, Any] | None = {"side": ev.get("side")} if ev.get("side") else None
             columns: dict[str, Any] = {
                 "symbol_id": sid,
@@ -722,14 +1058,16 @@ async def run_store(
                 at=TimestampNanos(int(lt) * 1_000_000),
             )
 
+        await _stream_loop("liquidations", liq_factory, handle)
+
     async def pump_candles(sender: Sender, sym: str) -> None:
-        async for c in gd.closed_1m_candles(symbol=sym):
+        async def handle(c: list) -> None:
             if len(c) < 6:
-                continue
+                return
             open_ms = int(c[0])
             sid = await registry.id_for(sym)
             if sid is None:
-                continue
+                return
             columns: dict[str, Any] = {
                 "symbol_id": sid,
                 "open": float(c[1]),
@@ -747,6 +1085,12 @@ async def run_store(
                 columns=columns,
                 at=TimestampNanos(open_ms * 1_000_000),
             )
+
+        await _stream_loop(
+            f"candles_1m[{sym}]",
+            lambda: gd.closed_1m_candles(symbol=sym),
+            handle,
+        )
 
     if "HOST" in conf.upper():
         log.warning(
@@ -776,6 +1120,24 @@ async def run_store(
             verify_interval_sec / 60.0,
         )
 
+    auto_repair_after_verify = _env_truthy("STORE_VERIFY_AUTO_REPAIR", False)
+    repair_keep = os.environ.get("STORE_VERIFY_REPAIR_KEEP", "newest").strip().lower()
+    if repair_keep not in ("newest", "oldest"):
+        repair_keep = "newest"
+    repair_lb_raw = os.environ.get("STORE_VERIFY_REPAIR_LOOKBACK_HOURS", "").strip()
+    repair_lookback_period: float | None
+    if repair_lb_raw:
+        repair_lookback_period = float(repair_lb_raw)
+    else:
+        repair_lookback_period = None
+
+    if verify_interval_sec > 0 and auto_repair_after_verify:
+        log.info(
+            "STORE_VERIFY_AUTO_REPAIR=1: se a verificação falhar, corre reparação tick_trades (apply) "
+            "e nova verificação (keep=%s).",
+            repair_keep,
+        )
+
     async def heartbeat() -> None:
         n = 0
         while True:
@@ -791,11 +1153,29 @@ async def run_store(
         while True:
             await asyncio.sleep(verify_interval_sec)
             try:
+                log.info("Verificação automática: a executar consultas à QuestDB…")
                 rep = await asyncio.to_thread(
                     verify_store_data,
                     http_base=http_base,
                 )
                 log_store_health_report(rep)
+                if not rep.ok and auto_repair_after_verify:
+                    log.warning(
+                        "Verificação automática: problemas — reparação tick_trades (apply) e nova verificação."
+                    )
+                    await asyncio.to_thread(
+                        repair_tick_trades_questdb,
+                        dry_run=False,
+                        http_base=http_base,
+                        lookback_hours=repair_lookback_period,
+                        keep=repair_keep,
+                    )
+                    rep2 = await asyncio.to_thread(
+                        verify_store_data,
+                        http_base=http_base,
+                    )
+                    log.info("Verificação automática: após reparação:")
+                    log_store_health_report(rep2)
             except Exception:
                 log.exception("Verificação automática dos dados falhou")
 
@@ -827,9 +1207,60 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     if len(sys.argv) >= 2 and sys.argv[1] in ("--verify", "verify"):
+        rest = sys.argv[2:]
+        auto_repair = _env_truthy("STORE_VERIFY_AUTO_REPAIR", False)
+        if "--auto-repair" in rest:
+            auto_repair = True
+        if "--no-auto-repair" in rest:
+            auto_repair = False
+        repair_lookback_cli: float | None = None
+        repair_keep_cli = "newest"
+        for a in rest:
+            if a.startswith("--repair-lookback-hours="):
+                repair_lookback_cli = float(a.split("=", 1)[1].strip())
+            elif a.startswith("--repair-keep="):
+                repair_keep_cli = a.split("=", 1)[1].strip().lower()
+        if repair_keep_cli not in ("newest", "oldest"):
+            log.error("--repair-keep deve ser newest ou oldest")
+            raise SystemExit(2)
         rep = verify_store_data()
         log_store_health_report(rep)
+        if not rep.ok and auto_repair:
+            log.warning(
+                "Verificação com problemas — reparação tick_trades (apply) e nova verificação "
+                "(keep=%s).",
+                repair_keep_cli,
+            )
+            stats = repair_tick_trades_questdb(
+                dry_run=False,
+                lookback_hours=repair_lookback_cli,
+                keep=repair_keep_cli,
+            )
+            log.info("Reparação concluída: %s", stats)
+            rep2 = verify_store_data()
+            log.info("— Verificação após reparação —")
+            log_store_health_report(rep2)
+            raise SystemExit(0 if rep2.ok else 2)
         raise SystemExit(0 if rep.ok else 2)
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--repair-tick-trades", "repair-ticks"):
+        dry_run = "--apply" not in sys.argv
+        lookback_hours: float | None = None
+        keep = "newest"
+        for a in sys.argv[2:]:
+            if a.startswith("--lookback-hours="):
+                lookback_hours = float(a.split("=", 1)[1].strip())
+            elif a.startswith("--keep="):
+                keep = a.split("=", 1)[1].strip().lower()
+        if keep not in ("newest", "oldest"):
+            log.error("--keep deve ser newest ou oldest")
+            raise SystemExit(2)
+        stats = repair_tick_trades_questdb(
+            dry_run=dry_run,
+            lookback_hours=lookback_hours,
+            keep=keep,
+        )
+        log.info("Resumo reparação tick_trades: %s", stats)
+        raise SystemExit(0)
     signal.signal(signal.SIGINT, _shutdown_signal)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _shutdown_signal)
