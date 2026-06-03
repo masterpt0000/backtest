@@ -5,8 +5,12 @@ orjson>=3.10.0
 numpy>=1.24.0,<3
 pandas>=2.0.0,<3
 vectorbt>=0.26.0
+# Indicadores TA-Lib (requer também a biblioteca C TA-Lib no sistema; ver README do pacote)
+TA-Lib>=0.4.0
 numba>=0.59.0
 sqlalchemy>=2.0.0
 psycopg[binary]>=3.2.0
 python-dotenv>=1.0.0
 ccxt>=4.4.0
+redis>=5.0.0
+rq>=2.0.0

@@ -1,0 +1,14 @@
+{
+  "id": "bollinger_mean_revert",
+  "name": "Teste — Bollinger reversão (20, 2σ)",
+  "vbt_strategy": "bollinger_mean_revert",
+  "indicators": [
+    {
+      "id": "bb",
+      "label": "Bollinger (20, 2)",
+      "group": "overlays",
+      "kind": "bollinger",
+      "params": { "period": 20, "mult": 2 }
+    }
+  ]
+}

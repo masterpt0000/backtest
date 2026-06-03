@@ -73,6 +73,9 @@ except ImportError:
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'traders_py'))
+_BACKEND_DIR = os.path.join(ROOT, 'backend')
+if os.path.isdir(_BACKEND_DIR):
+    sys.path.insert(0, _BACKEND_DIR)
 
 from config import TOTAL_CASH_TEST
 
@@ -83,15 +86,9 @@ DEFAULT_TOP       = 10
 MIN_TRADES        = 50
 MIN_CANDLES       = 1000
 
-# Fallback quando o módulo *_vbt não define INDICATOR_PARAM_NAMES e a inferência
-# a partir de compute_indicators() não encontra chaves (união de estratégias conhecidas).
-FALLBACK_IND_PARAM_NAMES = frozenset({
-    'atr_wma_length', 'ema_fast_span', 'ema_span', 'ema2_span', 'ema3_span',
-    'dif_ema_shift', 'dif_ema2_shift', 'dif_ema3_shift',
-    'rsi_close_length', 'rsi_vwap_length', 'adx_length', 'len_adx',
-    'envelope_length', 'envelope_mult',
-    'vol_sma_length',
-})
+# Sem lista fixa de nomes: cada *_vbt deve definir INDICATOR_PARAM_NAMES ou ser
+# inferível a partir de compute_indicators + get_strategy_parameters.
+FALLBACK_IND_PARAM_NAMES: frozenset = frozenset()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -223,7 +220,7 @@ def resolve_indicator_param_names(vbt_mod, param_specs: dict) -> frozenset:
     if fb:
         return frozenset(fb)
 
-    return frozenset(FALLBACK_IND_PARAM_NAMES)
+    return frozenset()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -243,8 +240,22 @@ def _param_fingerprint(d: dict) -> tuple:
     """Chave estável para dedupe de combinações de parâmetros."""
 
     def _atom(x):
+        # Evita TypeError em sorted() quando vêm np.float64/np.int64 (ex.: builder → job em thread).
+        if isinstance(x, (np.generic,)):
+            try:
+                x = x.item()
+            except Exception:
+                pass
+        if isinstance(x, (np.integer, np.int64, np.int32)):
+            return int(x)
+        if isinstance(x, (np.floating, np.float64, np.float32)):
+            return round(float(x), 8)
         if isinstance(x, float):
             return round(x, 8)
+        if isinstance(x, bool):
+            return x
+        if isinstance(x, int):
+            return x
         return x
 
     return tuple(sorted((str(k), _atom(d[k])) for k in sorted(d.keys())))
@@ -587,7 +598,302 @@ def _vbt_result_row(
         'expectancy':   _f('expectancy'),
         'best_params':  {**ind_params, **thr_list[col_i]},
         'n_valid':      int(n_valid),
+        'vbt_col':      int(col_i),
     }
+
+
+def _include_chart_overlay() -> bool:
+    v = os.environ.get('BACKTEST_INCLUDE_CHART_OVERLAY', '1').strip().lower()
+    return v not in ('0', 'false', 'no', 'off')
+
+
+def _downsample_equity(times: list[int], values: list[float], max_points: int) -> tuple[list[int], list[float]]:
+    n = len(times)
+    if n <= max_points or n < 2:
+        return times, values
+    step = max(1, n // max_points)
+    t2 = [times[i] for i in range(0, n, step)]
+    v2 = [values[i] for i in range(0, n, step)]
+    if t2[-1] != times[-1]:
+        t2.append(times[-1])
+        v2.append(values[-1])
+    return t2, v2
+
+
+def _bar_unix_t(df: pd.DataFrame, i: int) -> int:
+    ts = df.index[i]
+    if hasattr(ts, 'timestamp'):
+        return int(ts.timestamp())
+    return int(pd.Timestamp(ts).timestamp())
+
+
+def trade_log_rows_from_pf(pf, df, col: int, max_pairs: int = 500) -> list[dict]:
+    """
+    Lista alinhada ao tipo ``BacktestTradeRow`` no frontend (tempos UNIX s, lado, P&L %).
+    """
+    out: list[dict] = []
+    n = len(df.index)
+    try:
+        rec = pf.trades.records
+        if rec is None or len(rec) == 0:
+            return out
+        tr = pd.DataFrame(rec)
+        if "col" in tr.columns:
+            tr = tr[tr["col"].astype(int) == int(col)]
+        for _, trw in tr.iterrows():
+            if len(out) >= max_pairs:
+                break
+            ei = xi = None
+            for k in ("entry_idx", "Entry Index", "entry_index"):
+                if k in trw.index and trw[k] is not None and not (
+                    isinstance(trw[k], float) and np.isnan(trw[k])
+                ):
+                    try:
+                        ei = int(trw[k])
+                        break
+                    except Exception:
+                        pass
+            for k in ("exit_idx", "Exit Index", "exit_index"):
+                if k in trw.index and trw[k] is not None and not (
+                    isinstance(trw[k], float) and np.isnan(trw[k])
+                ):
+                    try:
+                        xi = int(trw[k])
+                        break
+                    except Exception:
+                        pass
+            if ei is None or xi is None:
+                continue
+            if not (0 <= ei < n and 0 <= xi < n):
+                continue
+            direction = 0
+            for k in ("direction", "Direction"):
+                if k in trw.index:
+                    try:
+                        direction = int(trw[k])
+                        break
+                    except Exception:
+                        pass
+            ret = 0.0
+            for k in ("return", "Return"):
+                if k in trw.index:
+                    try:
+                        ret = float(trw[k])
+                        break
+                    except Exception:
+                        pass
+            out.append(
+                {
+                    "entryTime": _bar_unix_t(df, ei),
+                    "exitTime": _bar_unix_t(df, xi),
+                    "side": "short" if direction == 1 else "long",
+                    "pnl_pct": ret * 100.0,
+                }
+            )
+    except Exception:
+        pass
+    return out
+
+
+def chart_overlay_from_pf(
+    pf,
+    df,
+    col: int,
+    *,
+    ignore_overlay_env: bool = False,
+    max_equity_points: int = 2500,
+) -> dict | None:
+    """
+    Dados para o gráfico (Lightweight Charts): marcadores de entrada/saída + curva de equity.
+    """
+    if not ignore_overlay_env and not _include_chart_overlay():
+        return None
+    try:
+        val = pf.value()
+    except Exception:
+        return None
+    if val is None:
+        return None
+    arr = np.asarray(val, dtype=np.float64)
+    if arr.ndim == 2:
+        eq_s = arr[:, int(col)]
+    else:
+        eq_s = np.asarray(arr, dtype=np.float64).ravel()
+    n = len(df.index)
+    if len(eq_s) < n:
+        eq_s = np.pad(eq_s, (0, n - len(eq_s)), mode='edge')[:n]
+    elif len(eq_s) > n:
+        eq_s = eq_s[:n]
+    ts_sec = (df.index.astype(np.int64) // 10**9).to_numpy(dtype=np.int64)
+    t_list = [int(x) for x in ts_sec]
+    v_list = [float(x) for x in eq_s]
+    cap = max(32, int(max_equity_points))
+    t_list, v_list = _downsample_equity(t_list, v_list, cap)
+    equity = [{'t': t, 'v': v} for t, v in zip(t_list, v_list)]
+
+    markers: list[dict] = []
+    try:
+        rec = pf.trades.records
+        if rec is not None and len(rec) > 0:
+            tr = pd.DataFrame(rec)
+            if 'col' in tr.columns:
+                tr = tr[tr['col'].astype(int) == int(col)]
+            max_pairs = 400
+            for _, trw in tr.iterrows():
+                if len(markers) >= max_pairs * 2:
+                    break
+                try:
+                    ei = int(trw['entry_idx'])
+                    xi = int(trw['exit_idx'])
+                except Exception:
+                    continue
+                if 'direction' in trw.index:
+                    is_short = int(trw['direction']) == 1
+                else:
+                    is_short = False
+                if 0 <= ei < n:
+                    te = _bar_unix_t(df, ei)
+                    if is_short:
+                        markers.append(
+                            {
+                                'time': te,
+                                'position': 'aboveBar',
+                                'color': '#f87171',
+                                'shape': 'arrowDown',
+                                'text': 'S',
+                            }
+                        )
+                    else:
+                        markers.append(
+                            {
+                                'time': te,
+                                'position': 'belowBar',
+                                'color': '#4ade80',
+                                'shape': 'arrowUp',
+                                'text': 'B',
+                            }
+                        )
+                if 0 <= xi < n:
+                    tx = _bar_unix_t(df, xi)
+                    # Sair: âmbar — distingue de entradas (verde/vermelho) no gráfico
+                    if is_short:
+                        markers.append(
+                            {
+                                'time': tx,
+                                'position': 'belowBar',
+                                'color': '#f59e0b',
+                                'shape': 'arrowUp',
+                                'text': 'C',
+                            }
+                        )
+                    else:
+                        markers.append(
+                            {
+                                'time': tx,
+                                'position': 'aboveBar',
+                                'color': '#f59e0b',
+                                'shape': 'arrowDown',
+                                'text': 'S',
+                            }
+                        )
+    except Exception:
+        pass
+
+    ic = None
+    try:
+        ic = float(getattr(pf, 'init_cash', TOTAL_CASH_TEST))
+    except Exception:
+        ic = float(TOTAL_CASH_TEST)
+
+    return {
+        'markers': markers,
+        'equity': equity,
+        'initial_cash': ic,
+    }
+
+
+def export_pf_trial_curves(
+    pf,
+    df,
+    thr_list: list[dict],
+    ind_params: dict,
+    symbol: str,
+    *,
+    best_by: str,
+    max_trials: int,
+    max_equity_points: int = 400,
+    ignore_overlay_env: bool = True,
+    trial_index_offset: int = 0,
+) -> list[dict]:
+    """
+    Exporta curvas de equity e métricas por coluna do portfolio (cada threshold / teste).
+    Só inclui colunas com ``n_trades >= MIN_TRADES``, ordenadas por ``best_by``.
+    """
+    nc = len(thr_list)
+    if nc < 1:
+        return []
+    metrics = _extract_vbt_metrics(pf, nc)
+    valid_mask = metrics['n_trades'] >= MIN_TRADES
+    if not valid_mask.any():
+        return []
+
+    scores = _score_metric(metrics, best_by)
+    if len(scores) != nc:
+        scores = np.full(nc, -np.inf)
+    scores_masked = np.where(valid_mask, scores, -np.inf)
+    order = np.argsort(-scores_masked)
+    n_valid = int(valid_mask.sum())
+    out: list[dict] = []
+    cap = max(1, int(max_trials))
+
+    for j in order:
+        if len(out) >= cap:
+            break
+        i = int(j)
+        if not np.isfinite(scores_masked[i]) or scores_masked[i] <= -np.inf:
+            continue
+
+        row = _vbt_result_row(metrics, i, symbol, ind_params, thr_list, n_valid)
+        ov = chart_overlay_from_pf(
+            pf,
+            df,
+            i,
+            ignore_overlay_env=ignore_overlay_env,
+            max_equity_points=max_equity_points,
+        )
+        equity = ov.get('equity') if isinstance(ov, dict) else None
+        out.append({
+            'trial_index': trial_index_offset + len(out),
+            'return_pct': row['return_pct'],
+            'win_rate': row['win_rate'],
+            'trades': row['trades'],
+            'max_dd': row['max_dd'],
+            'sharpe': row['sharpe'],
+            'profit_fct': row['profit_fct'],
+            'expectancy': row['expectancy'],
+            'best_params': row['best_params'],
+            'equity': equity if isinstance(equity, list) else [],
+        })
+    return out
+
+
+def _vbt_exec_portfolio_kwargs(
+    exec_fee_pct_per_fill: float = 0.0,
+    exec_slippage_pct: float = 0.0,
+    exec_half_spread_pct: float = 0.0,
+) -> dict:
+    """
+    Map UI/job percentages to vectorbt ``Portfolio.from_signals`` kwargs.
+    Effective slippage fraction = (slippage_pct + half_spread_pct) / 100 (merged for vectorbt).
+    """
+    fee_frac = max(0.0, float(exec_fee_pct_per_fill)) / 100.0
+    slip_frac = max(0.0, float(exec_slippage_pct) + float(exec_half_spread_pct)) / 100.0
+    kw: dict = {}
+    if fee_frac > 0:
+        kw['fees'] = fee_frac
+    if slip_frac > 0:
+        kw['slippage'] = slip_frac
+    return kw
 
 
 def run_vbt_backtest_topk(
@@ -600,6 +906,13 @@ def run_vbt_backtest_topk(
     best_by: str = 'return_pct',
     freq: str | None = None,
     top_k: int = 3,
+    *,
+    pf_sink: list | None = None,
+    ignore_overlay_env: bool = False,
+    include_chart_overlay: bool = True,
+    exec_fee_pct_per_fill: float = 0.0,
+    exec_slippage_pct: float = 0.0,
+    exec_half_spread_pct: float = 0.0,
 ) -> list[dict]:
     """
     Igual a ``run_vbt_backtest`` mas devolve até ``top_k`` combinações válidas
@@ -629,6 +942,11 @@ def run_vbt_backtest_topk(
         tp_stop = tp_arr if len(np.unique(tp_arr)) > 1 else float(tp_arr[0])
 
     _freq = freq if freq is not None else '1min'
+    exec_kw = _vbt_exec_portfolio_kwargs(
+        exec_fee_pct_per_fill,
+        exec_slippage_pct,
+        exec_half_spread_pct,
+    )
     try:
         pf = vbt.Portfolio.from_signals(
             close               = df['Close'],
@@ -641,10 +959,14 @@ def run_vbt_backtest_topk(
             init_cash           = float(TOTAL_CASH_TEST),
             freq                = _freq,
             upon_opposite_entry = 'close',
+            **exec_kw,
         )
     except Exception as e:
         print(f"  ⚠️ vbt.Portfolio falhou: {e}")
         return []
+
+    if pf_sink is not None:
+        pf_sink.append(pf)
 
     metrics = _extract_vbt_metrics(pf, nc)
 
@@ -667,7 +989,18 @@ def run_vbt_backtest_topk(
         s = scores_masked[i]
         if not np.isfinite(s) or s <= -np.inf:
             continue
-        rows.append(_vbt_result_row(metrics, i, symbol, ind_params, thr_list, n_valid))
+        row = _vbt_result_row(metrics, i, symbol, ind_params, thr_list, n_valid)
+        if include_chart_overlay:
+            try:
+                ov = chart_overlay_from_pf(pf, df, i, ignore_overlay_env=ignore_overlay_env)
+            except Exception:
+                ov = None
+            if ov is not None:
+                row['chart_overlay'] = ov
+        row['exec_fee_pct_per_fill'] = round(float(exec_fee_pct_per_fill), 6)
+        row['exec_slippage_pct'] = round(float(exec_slippage_pct), 6)
+        row['exec_half_spread_pct'] = round(float(exec_half_spread_pct), 6)
+        rows.append(row)
     return rows
 
 
@@ -680,6 +1013,10 @@ def run_vbt_backtest(
     compute_indicators_fn,
     best_by: str = 'return_pct',
     freq: str | None = None,
+    *,
+    exec_fee_pct_per_fill: float = 0.0,
+    exec_slippage_pct: float = 0.0,
+    exec_half_spread_pct: float = 0.0,
 ) -> dict | None:
     """
     Para um único conjunto de ind_params e todos os thr_list (vectorizado):
@@ -700,6 +1037,9 @@ def run_vbt_backtest(
         best_by=best_by,
         freq=freq,
         top_k=1,
+        exec_fee_pct_per_fill=exec_fee_pct_per_fill,
+        exec_slippage_pct=exec_slippage_pct,
+        exec_half_spread_pct=exec_half_spread_pct,
     )
     return rows[0] if rows else None
 

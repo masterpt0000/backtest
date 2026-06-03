@@ -76,3 +76,19 @@ CREATE TABLE IF NOT EXISTS liquidations (
     exchange_ts TIMESTAMP,
     symbol_id INT
 ) timestamp(local_ts) PARTITION BY DAY;
+
+CREATE TABLE IF NOT EXISTS chart_features_1m (
+    ts TIMESTAMP,
+    symbol_id INT,
+    liq_long DOUBLE,
+    liq_short DOUBLE,
+    tick_buy_vol DOUBLE,
+    tick_sell_vol DOUBLE,
+    oi_snap DOUBLE,
+    mark_px DOUBLE,
+    funding_rate DOUBLE,
+    index_px DOUBLE,
+    ob_spread_avg DOUBLE,
+    ob_spread_count INT,
+    ob_imb_snap DOUBLE
+) timestamp(ts) PARTITION BY MONTH;

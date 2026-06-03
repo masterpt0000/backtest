@@ -1,0 +1,14 @@
+{
+  "id": "rsi_level_flip",
+  "name": "Teste — RSI 30/55 long · 70/45 short",
+  "vbt_strategy": "rsi_level_flip",
+  "indicators": [
+    {
+      "id": "rsi",
+      "label": "RSI (14)",
+      "group": "studies",
+      "kind": "rsi",
+      "params": { "period": 14 }
+    }
+  ]
+}

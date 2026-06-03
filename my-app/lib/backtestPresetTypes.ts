@@ -5,6 +5,8 @@ export type BacktestPresetParamsV1 = {
   version: 1;
   tab: "single" | "optimize";
   timeframe: string;
+  /** Preferência multi-TF (preset pode omitir → só ``timeframe``). */
+  timeframes?: string[];
   range_preset: BacktestRangePreset;
   initial_cash: number;
   num_tests: number;
@@ -16,6 +18,18 @@ export type BacktestPresetParamsV1 = {
   optimize_top_k: number;
   holdout_pct: number;
   symbol_ids: number[];
+  include_ui_charts?: boolean;
+  validation_framework?: "standard" | "walk_forward" | "monte_carlo";
+  validation_frameworks?: ("standard" | "walk_forward" | "monte_carlo")[];
+  wf_n_splits?: number;
+  wf_min_segment_bars?: number;
+  mc_runs?: number;
+  mc_seed?: string;
+  param_drift_enabled?: boolean;
+  param_drift_pct_by_key?: Record<string, number>;
+  exec_fee_pct_per_fill?: number;
+  exec_slippage_pct?: number;
+  exec_half_spread_pct?: number;
 };
 
 export type StrategyPresetRow = {

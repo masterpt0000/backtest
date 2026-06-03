@@ -1,5 +1,7 @@
 # PostgreSQL para dados de aplicação (estratégias, jobs, parâmetros).
-# QuestDB continua separado (velas). Subir só Postgres: docker compose up -d postgres
+# Redis para filas RQ dos jobs pesados do chart.
+# QuestDB continua separado (velas).
+# Subir serviços app: docker compose up -d postgres redis
 services:
   postgres:
     image: postgres:16-alpine
@@ -13,5 +15,15 @@ services:
     volumes:
       - backtest_pg_data:/var/lib/postgresql/data
 
+  redis:
+    image: redis:7-alpine
+    container_name: backtest-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - backtest_redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+
 volumes:
   backtest_pg_data:
+  backtest_redis_data:

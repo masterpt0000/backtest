@@ -124,7 +124,12 @@ export class LiquidationMicroCandlesPrimitive implements ISeriesPrimitive {
       return;
     }
 
-    const ts = chart.timeScale();
+    let ts: ITimeScaleApi<Time>;
+    try {
+      ts = chart.timeScale();
+    } catch {
+      return;
+    }
     const bars = this._barTimes;
     const tToIdx = new Map<number, number>();
     for (let i = 0; i < bars.length; i++) {

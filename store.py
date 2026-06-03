@@ -42,6 +42,10 @@ Variáveis de ambiente (opcional, para throughput de backfill)::
     STORE_STREAM_RETRY_BASE_SEC=2    # backoff após erro WS / rede
     STORE_STREAM_RETRY_MAX_SEC=120
     STORE_TICK_TRADES_DEDUP_KEYS=500000   # LRU de (symbol_id, trade_id) antes do ILP — evita duplicados por replay WS
+    STORE_CHART_FEATURES_ENABLED=1
+    STORE_CHART_FEATURES_INTERVAL_SEC=300
+    STORE_CHART_FEATURES_LOOKBACK_MINUTES=10
+    STORE_CHART_FEATURES_LAG_SEC=90
     QUESTDB_HTTP_URL=http://127.0.0.1:9000   # /exec para listar ``symbols`` e registry (obrigatório se ILP for tcp::…)
 
 Cria a tabela ``symbols`` e fact tables com ``symbol_id`` — vê ``questdb_schema_symbols.sql``.
@@ -64,12 +68,20 @@ import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, TypeVar
 
+import httpx
 from questdb.ingress import IngressError, Sender, TimestampNanos  # type: ignore[reportMissingModuleSource]
 
 import get_data as gd
+
+_BACKEND_DIR = Path(__file__).resolve().parent / "backend"
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
+
+from chart_feature_aggregates import backfill_chart_features_1m_range  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -888,6 +900,7 @@ async def run_store(
     sym_list = _resolve_store_symbols(http_base, symbols)
     registry = _SymbolRegistry(http_base)
     await registry.warm(sym_list)
+    symbol_ids = [sid for sid in (await asyncio.gather(*(registry.id_for(sym) for sym in sym_list))) if sid is not None]
     lock = asyncio.Lock()
     tick_dedup = _TickTradeDedup(_env_int("STORE_TICK_TRADES_DEDUP_KEYS", 500_000))
     tick_dedup_lock = asyncio.Lock()
@@ -1163,6 +1176,10 @@ async def run_store(
     verify_interval_sec = _env_int(
         "STORE_VERIFY_INTERVAL_SEC", _DEFAULT_VERIFY_INTERVAL_SEC
     )
+    chart_features_enabled = _env_truthy("STORE_CHART_FEATURES_ENABLED", True)
+    chart_features_interval_sec = _env_int("STORE_CHART_FEATURES_INTERVAL_SEC", 300)
+    chart_features_lookback_minutes = _env_int("STORE_CHART_FEATURES_LOOKBACK_MINUTES", 10)
+    chart_features_lag_sec = _env_int("STORE_CHART_FEATURES_LAG_SEC", 90)
     flush_rows = _env_int("STORE_AUTO_FLUSH_ROWS", _DEFAULT_FLUSH_ROWS)
     flush_interval_ns = _env_int(
         "STORE_AUTO_FLUSH_INTERVAL_NS", _DEFAULT_FLUSH_INTERVAL_NS
@@ -1173,6 +1190,15 @@ async def run_store(
             "Verificação automática dos dados a cada %s s (~%.1f min).",
             verify_interval_sec,
             verify_interval_sec / 60.0,
+        )
+
+    if chart_features_enabled:
+        log.info(
+            "Materialização chart_features_1m activa: cada %s s, lookback=%s min, lag=%s s, symbols=%s.",
+            chart_features_interval_sec,
+            chart_features_lookback_minutes,
+            chart_features_lag_sec,
+            symbol_ids,
         )
 
     auto_repair_after_verify = _env_truthy("STORE_VERIFY_AUTO_REPAIR", False)
@@ -1234,6 +1260,39 @@ async def run_store(
             except Exception:
                 log.exception("Verificação automática dos dados falhou")
 
+    async def periodic_chart_features_1m() -> None:
+        await asyncio.sleep(min(15, max(1, chart_features_interval_sec)))
+        timeout = httpx.Timeout(120.0, connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            while True:
+                try:
+                    now_sec = int(datetime.now(tz=timezone.utc).timestamp())
+                    end_sec = ((now_sec - max(0, chart_features_lag_sec)) // 60) * 60
+                    start_sec = end_sec - max(1, chart_features_lookback_minutes) * 60
+                    if end_sec > start_sec:
+                        total_inserted = 0
+                        for sid in symbol_ids:
+                            res = await backfill_chart_features_1m_range(
+                                client,
+                                int(sid),
+                                start_sec,
+                                end_sec,
+                                chunk_minutes=max(60, int(chart_features_lookback_minutes)),
+                            )
+                            total_inserted += int(res.get("inserted") or 0)
+                            errs = res.get("errors") or []
+                            if errs:
+                                log.warning("chart_features_1m sid=%s errors=%s", sid, errs)
+                        log.info(
+                            "chart_features_1m: janela %s -> %s, inserted=%s",
+                            datetime.fromtimestamp(start_sec, tz=timezone.utc).isoformat(),
+                            datetime.fromtimestamp(end_sec, tz=timezone.utc).isoformat(),
+                            total_inserted,
+                        )
+                except Exception:
+                    log.exception("Materialização chart_features_1m falhou")
+                await asyncio.sleep(max(30, chart_features_interval_sec))
+
     with Sender.from_conf(
         conf,
         auto_flush_rows=flush_rows,
@@ -1243,6 +1302,8 @@ async def run_store(
             tg.create_task(heartbeat())
             if verify_interval_sec > 0:
                 tg.create_task(periodic_verify())
+            if chart_features_enabled and symbol_ids:
+                tg.create_task(periodic_chart_features_1m())
             for sym in sym_list:
                 tg.create_task(pump_tick_trades(sender, sym))
                 tg.create_task(pump_mark_funding(sender, sym))

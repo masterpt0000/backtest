@@ -79,3 +79,40 @@ class BacktestResultRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     job: Mapped[BacktestJobRecord] = relationship(back_populates="result_rows")
+
+
+class ChartBuilderStrategy(Base):
+    """
+    Especificação JSON (versionada) de estratégia construída no chart — simulação só no cliente JS.
+    """
+
+    __tablename__ = "chart_builder_strategies"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(256), default="")
+    spec: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ChartBuilderBlock(Base):
+    """
+    Template reutilizável de lógica do builder (filtro, zona, entrada/saída).
+
+    Estratégias guardam snapshots destes blocos; editar o template não altera
+    estratégias já criadas.
+    """
+
+    __tablename__ = "chart_builder_blocks"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(256), default="")
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    spec: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

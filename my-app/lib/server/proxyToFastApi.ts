@@ -159,6 +159,19 @@ export async function proxyFastApiPatchJson(
   });
 }
 
+export async function proxyFastApiPutJson(
+  pathWithLeadingSlash: string,
+  body: unknown,
+  timeoutMs: number = 30_000,
+): Promise<Response> {
+  return proxyNodeHttp(buildTargetUrl(pathWithLeadingSlash), {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+    timeoutMs,
+  });
+}
+
 export async function proxyFastApiDelete(
   pathWithLeadingSlash: string,
   timeoutMs: number = 10_000,

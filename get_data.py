@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 import time
 from collections.abc import AsyncIterator
@@ -9,18 +10,54 @@ SYMBOL = "WLD/USDC:USDC"
 TIMEFRAME = "1m"
 
 
+def _timeframe_ms(timeframe: str) -> int:
+    tf = (timeframe or "1m").strip().lower()
+    unit = tf[-1]
+    value = int(tf[:-1])
+    if unit == "m":
+        return value * 60_000
+    if unit == "h":
+        return value * 3_600_000
+    if unit == "d":
+        return value * 86_400_000
+    raise ValueError(f"timeframe não suportado: {timeframe!r}")
+
+
 async def closed_1m_candles(
     symbol: str = SYMBOL,
     timeframe: str = TIMEFRAME,
 ) -> AsyncIterator[list]:
     """
     Em cada minuto fechado, faz yield de [timestamp_ms, open, high, low, close, volume].
+
+    Importante: o snapshot de ``watch_ohlcv`` da Binance/CCXT pode ainda conter
+    OHLCV parcial do candle que acabou de fechar. Para o site bater com o bot,
+    usamos o websocket só como relógio e vamos buscar o candle fechado via REST.
     """
 
     def candle_with_open(ohlcv: list, open_ms: int) -> list | None:
         for row in ohlcv:
             if row[0] == open_ms:
                 return row
+        return None
+
+    async def fetch_final_closed(open_ms: int) -> list | None:
+        settle_sec = float(os.environ.get("STORE_CANDLE_REST_SETTLE_SEC", "5") or "5")
+        retries = max(1, int(os.environ.get("STORE_CANDLE_REST_RETRIES", "3") or "3"))
+        retry_sleep = float(os.environ.get("STORE_CANDLE_REST_RETRY_SLEEP_SEC", "1.5") or "1.5")
+        tf_ms = _timeframe_ms(timeframe)
+        target_ready_ms = open_ms + tf_ms + int(settle_sec * 1000)
+        wait_ms = target_ready_ms - int(time.time() * 1000)
+        if wait_ms > 0:
+            await asyncio.sleep(wait_ms / 1000.0)
+        since = max(0, open_ms - tf_ms)
+        for attempt in range(retries):
+            snap = await exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=4)
+            closed = candle_with_open(snap, open_ms)
+            if closed is not None:
+                return closed
+            if attempt + 1 < retries:
+                await asyncio.sleep(retry_sleep)
         return None
 
     exchange = ccxt.binance({"options": {"defaultType": "swap"}})
@@ -32,12 +69,7 @@ async def closed_1m_candles(
                 continue
             last_open = int(ohlcv[-1][0])
             if prev_open is not None and last_open != prev_open:
-                closed = candle_with_open(ohlcv, prev_open)
-                if closed is None:
-                    snap = await exchange.fetch_ohlcv(symbol, timeframe, limit=2)
-                    closed = candle_with_open(snap, prev_open)
-                    if closed is None and len(snap) >= 2 and snap[-2][0] == prev_open:
-                        closed = snap[-2]
+                closed = await fetch_final_closed(prev_open)
                 if closed is not None:
                     yield closed
             prev_open = last_open

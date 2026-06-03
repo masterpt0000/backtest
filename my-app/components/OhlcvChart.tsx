@@ -1,31 +1,46 @@
 "use client";
 
 import {
+  CandlestickSeries,
   createChart,
+  createSeriesMarkers,
+  HistogramSeries,
+  LineSeries,
   type IChartApi,
   type ISeriesApi,
+  type ISeriesMarkersPluginApi,
   type LogicalRange,
+  type SeriesMarker,
+  type Time,
   type UTCTimestamp,
   ColorType,
   CrosshairMode,
-  LineStyle,
 } from "lightweight-charts";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import type { LiveSnapshot } from "@/components/LiveMarketPanel";
 import {
-  barsAsSourceSeries,
-  bollingerSeries,
-  emaSeries,
-  rsiSeries,
-} from "@/lib/indicatorsFromBars";
+  denseValuesByBarIndex,
+  deltaHistogramColor,
+  effectiveDeltaLookbackBars,
+  effectiveDeltaNormalizeByPrice,
+  fmtIndicatorDeltaHud,
+  forwardFillSparseLineToBars,
+  indicatorDeltaHudSuffix,
+  indicatorDeltaValueAtBarIndex,
+  maybeApplyIndicatorDeltaSeries,
+} from "@/lib/indicatorDeltaTransform";
 import { bucketHeatColor, tapeBuyRatioBuckets } from "@/lib/liveTapeHeat";
-import { effectiveRsiLineColor } from "@/lib/indicatorLineColors";
 import {
   LiquidationMicroCandlesPrimitive,
   type LiquidationMicroCandle,
 } from "@/lib/liquidationMicroCandlesPrimitive";
-import type { IndicatorSource } from "@/lib/strategies";
+import { StrategyShadingBandsPrimitive } from "@/lib/strategyShadingBandsPrimitive";
+import { VolumeFootprintPrimitive } from "@/lib/volumeFootprintPrimitive";
+import type { BacktestChartLayer } from "@/lib/backtestChartLayer";
+import { CHART_FACT_SERIES, formatFeatHudValue } from "@/lib/chartFactSeriesCatalog";
+import type { IndicatorSource, IndicatorTimeframe, TrendCompositeParams } from "@/lib/strategies";
+import type { FootprintBar } from "@/lib/chartFootprintApi";
 
 export type CandleApiBar = { t: number; o: number; h: number; l: number; c: number; v: number };
 
@@ -42,30 +57,98 @@ function barsSortedUniqueByTime(bars: CandleApiBar[]): CandleApiBar[] {
     .map((k) => m.get(k)!);
 }
 
+/**
+ * lightweight-charts exige ``time`` estritamente crescente (sem duplicados).
+ * Agrupa por segundo UNIX truncado; mantém o **último** ponto por tempo.
+ */
+function chartTimeSeriesSortedUniqueByTime<T extends { time: UTCTimestamp; value: number }>(
+  pts: readonly T[],
+): T[] {
+  if (!pts.length) return [];
+  const byTime = new Map<number, T>();
+  for (const p of pts) {
+    const t = Math.trunc(Number(p.time));
+    if (!Number.isFinite(t)) continue;
+    byTime.set(t, { ...p, time: t as UTCTimestamp });
+  }
+  return [...byTime.keys()].sort((a, b) => a - b).map((k) => byTime.get(k)!);
+}
+
+function barsDataFingerprint(bars: CandleApiBar[]): string {
+  let h = 2166136261;
+  for (const b of bars) {
+    for (const x of [b.t, b.o, b.h, b.l, b.c, b.v]) {
+      h ^= Math.trunc(Number(x) * 1_000_000);
+      h = Math.imul(h, 16777619);
+    }
+  }
+  return `${bars.length}:${bars[0]?.t ?? 0}:${bars[bars.length - 1]?.t ?? 0}:${h >>> 0}`;
+}
+
 export type ChartIndicatorDef = {
   id: string;
-  kind: "ema" | "bollinger" | "rsi";
+  kind: "sma" | "atr" | "macd" | "talib" | "derived" | "trend_composite";
+  /** Da estratégia: overlay vs estudo (ex. RSI TA-Lib estudos num painel partilhado). */
+  group?: "overlays" | "studies";
   /** Rótulo na UI (ex. cabeçalho do painel RSI). */
   label?: string;
   period?: number;
   mult?: number;
+  fast?: number;
+  slow?: number;
+  signal?: number;
+  /** TA-Lib: nome da função (ex. ``RSI``). */
+  talibFunction?: string;
+  /** Parâmetros opcionais passados ao TA-Lib (ex. ``timeperiod``). */
+  talibParams?: Record<string, number>;
   /** Campo OHLC (ou composto) usado no cálculo. */
   source?: IndicatorSource;
-  /** EMA / RSI */
+  /** Timeframe usado no cálculo; "chart" = timeframe actual do gráfico. */
+  timeframe?: IndicatorTimeframe;
+  /** Indicador composto criado pelo user. */
+  derived?: {
+    mode: "chain" | "formula";
+    inputRef?: string;
+    transform?: "ema" | "sma" | "rsi" | "delta" | "roc" | "abs" | "normalize";
+    params?: Record<string, number>;
+    formula?: string;
+  };
+  /** Bloco servidor-only; série única no painel de estudos. */
+  trendComposite?: TrendCompositeParams;
+  /** Cor principal / palette base. */
   color?: string;
-  /** Bollinger: bandas superior / média / inferior */
+  /** TA-Lib multi-saída (ex. BBANDS): bandas. */
   colorUpper?: string;
   colorMid?: string;
   colorLower?: string;
   /** Espessura da linha (1–4). */
   lineWidth?: 1 | 2 | 3 | 4;
+  /** Diferença em N barras (valor − há N barras); 0 / omissão = série sem Δ. */
+  deltaLookbackBars?: number;
+  /** Se não for ``false``, o Δ divide-se pelo fecho na vela (escala versus preço). */
+  deltaNormalizeByPrice?: boolean;
 };
 
 /** Quando o índice lógico esquerdo fica abaixo disto, pede velas mais antigas. */
 const LOAD_MORE_WHEN_FROM = 80;
 
+/** Ignora pedidos automáticos de histórico logo após reposicionar o timeScale (evita rajadas). */
+const AUTO_OLDER_SUPPRESS_MS = 1200;
+
+/**
+ * Troca de par/TF: em vez de ``fitContent()`` em todo o dataset (índice esquerdo ~0 → pedidos encadeados),
+ * focamos as últimas barras — mais velas «visíveis» e menos triggers espúrios.
+ */
+const FIRST_VIEW_VISIBLE_LOGICAL_BARS = 1600;
+
+/** Com menos barras que isto, ``fitContent()`` continua a fazer sentido. */
+const FIRST_VIEW_FULL_FIT_MAX_BARS = 140;
+
 const EMPTY_DEFS: ChartIndicatorDef[] = [];
 const EMPTY_VIS: Record<string, boolean> = {};
+
+/** Altura mínima do canvas (velas+RSI no mesmo chart); abaixo disto o layout ainda funciona mas fica apertado. */
+const CHART_VIEWPORT_MIN_PX = 120;
 
 /** Altura inicial e fallback quando o flex ainda não deu altura ao contentor (evita ficar preso a 400px). */
 function defaultMainChartHeightPx(): number {
@@ -73,21 +156,15 @@ function defaultMainChartHeightPx(): number {
   return Math.max(400, Math.floor(window.innerHeight - 180));
 }
 
-/** Faixa dedicada ao eixo de tempo (estilo TradingView) — entre o principal e o estudo. */
-const TIME_RULER_ROW_PX = 24;
-
-/** Cabeçalho do painel de estudo (nome do indicador, período). */
+/** Cabeçalho acima do canvas (legenda RSI) — o RSI desenha-se no 2.º painel do mesmo gráfico. */
 const RSI_STUDY_HEADER_PX = 22;
 
-/** Altura útil do canvas RSI (px) — um pouco maior para o estudo não parecer “escondido”. */
-const RSI_PLOT_HEIGHT_PX = 112;
-
-/** Soma das faixas fixas abaixo do gráfico principal quando o RSI está visível. */
-const RSI_STACK_TOTAL_PX = TIME_RULER_ROW_PX + RSI_STUDY_HEADER_PX + RSI_PLOT_HEIGHT_PX;
+/** Espaço reservado fora do canvas quando há RSI (só legenda; eixo X é único no chart). */
+const RSI_CHROME_ABOVE_CHART_PX = RSI_STUDY_HEADER_PX + 6;
 
 /**
- * Mesmos valores no gráfico principal e no RSI para o eixo X coincidir.
- * `fixRightEdge` impede pan/zoom para além da última vela (o RSI de linha deixava de parecer prolongar-se no vazio).
+ * Eixo temporal único (painel de velas + RSI no mesmo ``createChart``).
+ * `fixRightEdge` evita pan para além da última vela sem dados.
  */
 const LINKED_TIME_SCALE = {
   fixRightEdge: true,
@@ -152,8 +229,76 @@ function fmtPx(x: number): string {
   if (!Number.isFinite(x)) return "—";
   const a = Math.abs(x);
   if (a >= 1000) return x.toFixed(2);
+  if (a >= 100) return x.toFixed(2);
+  if (a >= 10) return x.toFixed(3);
   if (a >= 1) return x.toFixed(4);
-  return x.toFixed(6);
+  if (a >= 0.1) return x.toFixed(7);
+  if (a >= 0.01) return x.toFixed(8);
+  return x.toFixed(8);
+}
+
+/** ``precision`` / ``minMove`` para o eixo OHLC — mais casas em activos sub-dollar. */
+function mainChartPriceFormatFromBars(bars: CandleApiBar[]): {
+  type: "price";
+  precision: number;
+  minMove: number;
+} {
+  if (!bars.length) return { type: "price", precision: 2, minMove: 0.01 };
+  const tail = bars.length > 500 ? bars.slice(-500) : bars;
+  const closes = tail
+    .map((b) => Math.abs(Number(b.c)))
+    .filter((x) => Number.isFinite(x) && x > 0);
+  if (!closes.length) return { type: "price", precision: 2, minMove: 0.01 };
+  const sorted = [...closes].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)] ?? sorted[0]!;
+
+  if (median >= 1000) return { type: "price", precision: 2, minMove: 0.01 };
+  if (median >= 100) return { type: "price", precision: 2, minMove: 0.01 };
+  if (median >= 10) return { type: "price", precision: 3, minMove: 0.001 };
+  if (median >= 1) return { type: "price", precision: 4, minMove: 0.0001 };
+  if (median >= 0.1) return { type: "price", precision: 7, minMove: 1e-7 };
+  if (median >= 0.01) return { type: "price", precision: 8, minMove: 1e-8 };
+  return { type: "price", precision: 8, minMove: 1e-8 };
+}
+
+/** ``precision`` / ``minMove`` para linhas/histogramas em painéis de estudo (RSI, derivados, Δ, MACD). */
+function studyPriceFormatFromNumericSamples(samples: readonly number[]): {
+  type: "price";
+  precision: number;
+  minMove: number;
+} {
+  const vals = samples.map((x) => Math.abs(Number(x))).filter((x) => Number.isFinite(x));
+  if (!vals.length) return { type: "price", precision: 6, minMove: 1e-6 };
+  const maxV = Math.max(...vals);
+  const positives = vals.filter((x) => x > 0);
+  const minPos = positives.length ? Math.min(...positives) : maxV;
+  const ref = maxV > 0 ? Math.max(maxV, minPos) : minPos;
+  if (!Number.isFinite(ref) || ref === 0)
+    return { type: "price", precision: 8, minMove: 1e-8 };
+
+  if (ref >= 100) return { type: "price", precision: 2, minMove: 0.01 };
+  if (ref >= 10) return { type: "price", precision: 3, minMove: 0.001 };
+  if (ref >= 1) return { type: "price", precision: 4, minMove: 0.0001 };
+  if (ref >= 0.1) return { type: "price", precision: 5, minMove: 1e-5 };
+  if (ref >= 0.01) return { type: "price", precision: 6, minMove: 1e-6 };
+  if (ref >= 1e-3) return { type: "price", precision: 7, minMove: 1e-7 };
+  return { type: "price", precision: 8, minMove: 1e-8 };
+}
+
+function applyStudyPriceFormatFromValues(
+  ser: {
+    applyOptions: (o: {
+      priceFormat?: { type: "price"; precision: number; minMove: number };
+    }) => void;
+  },
+  values: readonly number[],
+): void {
+  if (!values.length) return;
+  try {
+    ser.applyOptions({ priceFormat: studyPriceFormatFromNumericSamples(values) });
+  } catch {
+    /* série ou gráfico já descartados */
+  }
 }
 
 function fmtVolCompact(v: number): string {
@@ -169,11 +314,38 @@ function crosshairTimeToUnix(t: unknown): number | null {
   return null;
 }
 
+function lineValueAtOrBeforeBarT(
+  pts: { time: UTCTimestamp; value: number }[],
+  barT: UTCTimestamp,
+): number | undefined {
+  if (pts.length === 0) return undefined;
+  let best: number | undefined;
+  for (const p of pts) {
+    if (Number(p.time) <= Number(barT)) best = p.value;
+    else break;
+  }
+  return best;
+}
+
+type TaServerHud = {
+  lines: Record<string, { time: UTCTimestamp; value: number }[]>;
+  macd: Record<
+    string,
+    {
+      macd: { time: UTCTimestamp; value: number }[];
+      signal: { time: UTCTimestamp; value: number }[];
+      histogram: { time: UTCTimestamp; value: number; color?: string }[];
+    }
+  >;
+  talibMulti: Record<string, Record<string, { time: UTCTimestamp; value: number }[]>>;
+};
+
 function buildIndicatorHudLines(
   bars: CandleApiBar[],
   defs: ChartIndicatorDef[],
   vis: Record<string, boolean>,
   idx: number,
+  ta: TaServerHud | null,
 ): { key: string; label: string; value: string; color?: string }[] {
   if (idx < 0 || idx >= bars.length) return [];
   const out: { key: string; label: string; value: string; color?: string }[] = [];
@@ -181,113 +353,216 @@ function buildIndicatorHudLines(
 
   for (const d of defs) {
     if (vis[d.id] === false) continue;
-    const src = d.source ?? "close";
-    const bs = barsAsSourceSeries(bars, src);
+    const lb = effectiveDeltaLookbackBars(d);
+    const du = lb >= 1;
+    const norm = effectiveDeltaNormalizeByPrice(d);
 
-    if (d.kind === "ema") {
-      const period = d.period ?? 14;
-      const pts = emaSeries(bs, period);
-      const v = pts[idx]?.value;
-      if (v == null || !Number.isFinite(v)) continue;
+    const pushDeltaHud = (
+      key: string,
+      linePts: { time: UTCTimestamp; value: number }[],
+      labelStem: string,
+      clr: string | undefined,
+    ) => {
+      const dense = denseValuesByBarIndex(bars, forwardFillSparseLineToBars(bars, linePts));
+      const dv = indicatorDeltaValueAtBarIndex(bars, dense, idx, lb, norm);
+      if (dv == null || !Number.isFinite(dv)) return;
+      out.push({
+        key: `${key}__delta`,
+        label: `${labelStem.trim()}${indicatorDeltaHudSuffix(d)}`,
+        value: fmtIndicatorDeltaHud(dv),
+        color: clr,
+      });
+    };
+
+    if (d.kind === "sma" && ta) {
+      const pts = ta.lines[d.id];
+      if (!pts?.length) continue;
+      const rv = lineValueAtOrBeforeBarT(pts, barT);
+      if (rv == null || !Number.isFinite(rv)) continue;
       out.push({
         key: d.id,
-        label: d.label?.trim() || "EMA",
-        value: fmtPx(v),
-        color: d.color,
+        label: d.label?.trim() || `SMA ${d.period ?? 20}`,
+        value: fmtPx(rv),
+        color: d.color ?? "#c4b5fd",
       });
-    } else if (d.kind === "bollinger") {
-      const period = d.period ?? 20;
-      const mult = d.mult ?? 2;
-      const { upper, mid, lower } = bollingerSeries(bs, period, mult);
-      const u = upper.find((p) => p.time === barT)?.value;
-      const m = mid.find((p) => p.time === barT)?.value;
-      const l = lower.find((p) => p.time === barT)?.value;
-      const base = d.label?.trim() || "BB";
-      const cU = d.colorUpper ?? "#71717a";
-      const cM = d.colorMid ?? "#a1a1aa";
-      const cL = d.colorLower ?? "#71717a";
-      if (u != null && Number.isFinite(u))
-        out.push({ key: `${d.id}_u`, label: `${base} sup`, value: fmtPx(u), color: cU });
-      if (m != null && Number.isFinite(m))
-        out.push({ key: `${d.id}_m`, label: `${base}`, value: fmtPx(m), color: cM });
-      if (l != null && Number.isFinite(l))
-        out.push({ key: `${d.id}_l`, label: `${base} inf`, value: fmtPx(l), color: cL });
-    } else if (d.kind === "rsi") {
-      const period = d.period ?? 14;
-      const pts = rsiSeries(bs, period);
-      const v = pts.find((p) => p.time === barT)?.value;
-      if (v == null || !Number.isFinite(v)) continue;
-      const base = d.label?.trim() || "RSI";
+      if (du)
+        pushDeltaHud(
+          d.id,
+          pts,
+          d.label?.trim() || `SMA ${d.period ?? 20}`,
+          d.color ?? "#c4b5fd",
+        );
+    } else if (d.kind === "atr" && ta) {
+      const pts = ta.lines[d.id];
+      if (!pts?.length) continue;
+      const rv = lineValueAtOrBeforeBarT(pts, barT);
+      if (rv == null || !Number.isFinite(rv)) continue;
       out.push({
         key: d.id,
-        label: `${base} ${period}`,
-        value: v.toFixed(1),
-        color: effectiveRsiLineColor(d.id, d.color),
+        label: d.label?.trim() || `ATR ${d.period ?? 14}`,
+        value: fmtPx(rv),
+        color: d.color ?? "#fb923c",
       });
+      if (du)
+        pushDeltaHud(
+          d.id,
+          pts,
+          d.label?.trim() || `ATR ${d.period ?? 14}`,
+          d.color ?? "#fb923c",
+        );
+    } else if ((d.kind === "macd" || (d.kind === "talib" && d.talibFunction?.toUpperCase() === "MACD")) && ta) {
+      const m = ta.macd[d.id];
+      if (!m) continue;
+      const base = d.label?.trim() || "MACD";
+      const rows: {
+        hk: string;
+        raw: number | undefined;
+        linePts: { time: UTCTimestamp; value: number }[];
+        lab: string;
+        clr: string;
+      }[] = [
+        {
+          hk: `${d.id}_m`,
+          raw: lineValueAtOrBeforeBarT(m.macd, barT),
+          linePts: m.macd,
+          lab: `${base}`,
+          clr: d.color ?? "#22d3ee",
+        },
+        {
+          hk: `${d.id}_s`,
+          raw: lineValueAtOrBeforeBarT(m.signal, barT),
+          linePts: m.signal,
+          lab: `${base} sig`,
+          clr: "#a78bfa",
+        },
+        {
+          hk: `${d.id}_h`,
+          raw: lineValueAtOrBeforeBarT(
+            m.histogram as { time: UTCTimestamp; value: number }[],
+            barT,
+          ),
+          linePts: m.histogram.map((h) => ({ time: h.time, value: h.value })),
+          lab: `${base} hist`,
+          clr: "#94a3b8",
+        },
+      ];
+      for (const row of rows) {
+        if (row.raw == null || !Number.isFinite(row.raw)) continue;
+        out.push({
+          key: row.hk,
+          label: row.lab,
+          value: fmtPx(row.raw),
+          color: row.clr,
+        });
+        if (du) pushDeltaHud(row.hk, row.linePts, row.lab, row.clr);
+      }
+    } else if (d.kind === "trend_composite" && ta) {
+      const pts = ta.lines[d.id];
+      if (!pts?.length) continue;
+      const rv = lineValueAtOrBeforeBarT(pts, barT);
+      if (rv == null || !Number.isFinite(rv)) continue;
+      out.push({
+        key: d.id,
+        label: d.label?.trim() || "Trend composite",
+        value: rv.toFixed(2),
+        color: d.color ?? "#10b981",
+      });
+      if (du)
+        pushDeltaHud(
+          d.id,
+          pts,
+          d.label?.trim() || "Trend composite",
+          d.color ?? "#10b981",
+        );
+    } else if (d.kind === "derived" && ta) {
+      const pts = ta.lines[d.id];
+      if (!pts?.length) continue;
+      const rv = lineValueAtOrBeforeBarT(pts, barT);
+      if (rv == null || !Number.isFinite(rv)) continue;
+      out.push({
+        key: d.id,
+        label: d.label?.trim() || "Derivado",
+        value: fmtPx(rv),
+        color: d.color ?? "#f472b6",
+      });
+      if (du) pushDeltaHud(d.id, pts, d.label?.trim() || "Derivado", d.color ?? "#f472b6");
+    } else if (d.kind === "talib" && ta) {
+      const multi = ta.talibMulti[d.id];
+      if (multi) {
+        for (const [oname, pts] of Object.entries(multi)) {
+          const rv = lineValueAtOrBeforeBarT(pts, barT);
+          if (rv == null || !Number.isFinite(rv)) continue;
+          const base = d.label?.trim() || d.talibFunction || "TA";
+          const k = `${d.id}_${oname}`;
+          out.push({
+            key: k,
+            label: `${base} ${oname}`,
+            value: fmtPx(rv),
+            color: d.color,
+          });
+          if (du) pushDeltaHud(k, pts, `${base} ${oname}`, d.color);
+        }
+      } else {
+        const pts = ta.lines[d.id];
+        if (!pts?.length) continue;
+        const rv = lineValueAtOrBeforeBarT(pts, barT);
+        if (rv == null || !Number.isFinite(rv)) continue;
+        out.push({
+          key: d.id,
+          label: d.label?.trim() || d.talibFunction || "TA-Lib",
+          value: fmtPx(rv),
+          color: d.color ?? "#38bdf8",
+        });
+        if (du)
+          pushDeltaHud(
+            d.id,
+            pts,
+            d.label?.trim() || d.talibFunction || "TA-Lib",
+            d.color ?? "#38bdf8",
+          );
+      }
     }
   }
   return out;
 }
 
-function formatVisibleTime(t: unknown): string {
-  if (t == null) return "—";
-  if (typeof t === "number") {
-    const d = new Date(t * 1000);
-    return Number.isNaN(d.getTime())
-      ? "—"
-      : d.toLocaleDateString("pt-PT", { month: "short", day: "numeric", year: "numeric" });
-  }
-  if (typeof t === "string") return t;
-  if (typeof t === "object" && t !== null && "year" in t && "month" in t && "day" in t) {
-    const b = t as { year: number; month: number; day: number };
-    return `${String(b.day).padStart(2, "0")}/${String(b.month).padStart(2, "0")}/${b.year}`;
-  }
-  return "—";
+function featSeriesPriceFormat(id: string) {
+  if (id === "feat_funding_rate") return { type: "price" as const, precision: 8, minMove: 1e-8 };
+  if (id === "feat_tick_imbalance" || id === "feat_ob_imb_snap")
+    return { type: "price" as const, precision: 4, minMove: 0.0001 };
+  if (id === "feat_tick_buy_sell_ratio")
+    return { type: "price" as const, precision: 2, minMove: 0.01 };
+  if (
+    id === "feat_mark_px" ||
+    id === "feat_index_px" ||
+    id.endsWith("_px")
+  )
+    return { type: "price" as const, precision: 4, minMove: 0.0001 };
+  return { type: "price" as const, precision: 2, minMove: 0.01 };
 }
 
-function clampVisibleRangeToLastBar(
-  tr: { from: unknown; to: unknown },
-  lastBarTimeSec: number | null,
-): { from: unknown; to: unknown } {
-  if (lastBarTimeSec == null) return tr;
-  const to = tr.to;
-  if (typeof to === "number" && to > lastBarTimeSec) {
-    return { ...tr, to: lastBarTimeSec };
+function buildFeatHudLines(
+  idx: number,
+  bars: CandleApiBar[],
+  visibility: Record<string, boolean>,
+  series: Record<string, { time: UTCTimestamp; value: number }[]>,
+): { key: string; label: string; value: string; color?: string }[] {
+  if (idx < 0 || idx >= bars.length) return [];
+  const out: { key: string; label: string; value: string; color?: string }[] = [];
+  for (const e of CHART_FACT_SERIES) {
+    if (visibility[e.id] !== true) continue;
+    const pts = series[e.id];
+    if (!pts?.length || idx >= pts.length) continue;
+    const v = pts[idx]!.value;
+    if (!Number.isFinite(v)) continue;
+    out.push({
+      key: `feat:${e.id}`,
+      label: e.label,
+      value: formatFeatHudValue(e.id, v),
+      color: e.color,
+    });
   }
-  return tr;
-}
-
-/**
- * Copia o intervalo de tempo visível entre gráficos.
- * O lightweight-charts pode lançar se o alvo ainda não tiver dados para esse intervalo (ex.: RSI começa mais tarde).
- * Sem fitContent no alvo: evita intervalo estreito no RSI e eco RSI→principal que zoomava o gráfico principal.
- *
- * `lastBarTimeSec`: último timestamp de vela (s); corta `to` se o intervalo incluir “futuro” sem candles
- * (senão a linha do RSI prolongava-se na área vazia à direita).
- */
-function safeCopyVisibleTimeRange(
-  source: IChartApi,
-  target: IChartApi | null | undefined,
-  lastBarTimeSec: number | null = null,
-): void {
-  if (!target) return;
-  let tr: { from?: unknown; to?: unknown } | null = null;
-  try {
-    tr = source.timeScale().getVisibleRange() as { from?: unknown; to?: unknown } | null;
-  } catch {
-    return;
-  }
-  if (tr == null || tr.from == null || tr.to == null) return;
-  const clamped = clampVisibleRangeToLastBar(
-    tr as { from: unknown; to: unknown },
-    lastBarTimeSec,
-  );
-  try {
-    // TimeRange (BusinessDay | UTCTimestamp); o tipo público varia entre versões
-    target.timeScale().setVisibleRange(clamped as never);
-  } catch {
-    /* ignorar — fitContent aqui desencadeava zoom agressivo no principal */
-  }
+  return out;
 }
 
 type Props = {
@@ -301,18 +576,136 @@ type Props = {
   indicatorVisibility?: Record<string, boolean>;
   /** Dados live: linhas no gráfico, micro-velas de liquidação no preço, heat do tape. */
   liveSnapshot?: LiveSnapshot | null;
+  /**
+   * Resultado de backtest (vectorbt) para o par actual: B/S no preço, curva de equity noutro painel.
+   * Preenchido em ``app/chart`` quando o job em contexto tiver ``chart_overlay`` para este símbolo.
+   */
+  backtestChart?: BacktestChartLayer | null;
+  /** Nome da estratégia do gráfico (faixa de métricas do backtest). */
+  backtestStrategyLabel?: string | null;
+  /** `live` = simulação nas velas; `questdb` = resultado de job. */
+  backtestOverlayMode?: "live" | "questdb" | null;
+  /**
+   * Se falso, o equity fica fora (ex. ``StrategyTesterPanel``) e o painel extra do chart não é criado.
+   * Por omissão: integrado (segundo painel) — mantém compat.
+   */
+  embedBacktestEquityInChart?: boolean;
+  /** Se falso, esconde a faixa de KPI no topo; usar quando a métrica estiver noutro painel. */
+  backtestKpiInChart?: boolean;
+  /** Chamado com o `IChartApi` principal (velas) para sincronizar eixo de tempo. */
+  onMainChartApi?: (api: IChartApi | null) => void;
+  /** Séries SMA/ATR calculadas no FastAPI (pandas). */
+  taServerLines?: Record<string, { time: UTCTimestamp; value: number }[]>;
+  /** MACD (3 séries) do servidor; desenhadas no painel de estudo. */
+  taServerMacd?: Record<
+    string,
+    {
+      macd: { time: UTCTimestamp; value: number }[];
+      signal: { time: UTCTimestamp; value: number }[];
+      histogram: { time: UTCTimestamp; value: number; color?: string }[];
+    }
+  >;
+  /** TA-Lib multi-output (ex. bandas): várias linhas no preço. */
+  taServerTalibMulti?: Record<string, Record<string, { time: UTCTimestamp; value: number }[]>>;
+  /** Séries facetas QuestDB (`feat_*`) vindas da API Python; mesmo eixo temporal que as velas. */
+  featSeries?: Record<string, { time: UTCTimestamp; value: number }[]>;
+  /** Mostrar/ocultar linhas facetas por id (checklist na biblioteca). */
+  featVisibility?: Record<string, boolean>;
+  /** Volume footprint agregado por candle/preço; desenhado por cima das velas quando activo. */
+  footprintBars?: FootprintBar[] | null;
 };
 
+/**
+ * TA-Lib no painel de preço: MACD vai para painel MACD; RSI etc. para o painel de estudos.
+ * BBANDS (e bandas de preço) desenham-se sempre sobre as velas, mesmo que ``group`` na estratégia seja ``studies``.
+ */
+function talibDrawsOnMainPricePane(d: ChartIndicatorDef): boolean {
+  if (d.kind !== "talib") return true;
+  const fn = d.talibFunction?.trim().toUpperCase() ?? "";
+  if (fn === "MACD") return false;
+  if (fn === "BBANDS") return true;
+  return d.group !== "studies";
+}
+
+/** Estudos RSI/MACD/osciladores no segundo painel — BBANDS não (escala = preço). */
+function talibInRsiStudyPane(d: ChartIndicatorDef): boolean {
+  if (d.kind === "trend_composite" && d.group === "studies") return true;
+  if (d.kind !== "talib" || d.group !== "studies") return false;
+  const fn = d.talibFunction?.trim().toUpperCase() ?? "";
+  return fn !== "MACD" && fn !== "BBANDS";
+}
+
+function medianFinite(values: number[]): number | null {
+  const xs = values.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
+  if (!xs.length) return null;
+  return xs[Math.floor(xs.length / 2)] ?? null;
+}
+
+function rangeFinite(values: number[]): number | null {
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const x of values) {
+    if (!Number.isFinite(x)) continue;
+    lo = Math.min(lo, x);
+    hi = Math.max(hi, x);
+  }
+  return lo <= hi ? hi - lo : null;
+}
+
+function derivedLooksPriceScaled(
+  d: ChartIndicatorDef,
+  bars: CandleApiBar[],
+  data: { time: UTCTimestamp; value: number }[] | undefined,
+): boolean {
+  if (d.kind !== "derived") return true;
+  if (d.group === "studies") return false;
+
+  const priceMedian = medianFinite(bars.map((b) => b.c));
+  if (priceMedian == null || Math.abs(priceMedian) < 1e-12) return false;
+
+  if (!data?.length) {
+    const base = d.derived?.inputRef?.trim().toLowerCase() ?? "";
+    const tr = d.derived?.transform?.trim().toLowerCase() ?? "";
+    return d.derived?.mode === "chain" && ["close", "open", "high", "low", "hl2", "hlc3", "ohlc4"].includes(base) && ["ema", "sma"].includes(tr);
+  }
+
+  const vals = data.map((p) => p.value);
+  const valueMedian = medianFinite(vals.map((x) => Math.abs(x)));
+  if (valueMedian == null) return false;
+  const ratio = valueMedian / Math.abs(priceMedian);
+  if (ratio < 0.2 || ratio > 5) return false;
+
+  const priceRange = rangeFinite(bars.map((b) => b.c));
+  const valueRange = rangeFinite(vals);
+  if (priceRange != null && valueRange != null && priceRange > 1e-12 && valueRange / priceRange > 8) {
+    return false;
+  }
+  return true;
+}
+
 /** Chaves de linhas só no gráfico principal (sem RSI — RSI tem painel próprio). */
-function collectMainLineKeys(defs: ChartIndicatorDef[], vis: Record<string, boolean>): Set<string> {
+function collectMainLineKeys(
+  defs: ChartIndicatorDef[],
+  vis: Record<string, boolean>,
+  talibMulti: Record<string, Record<string, unknown>> | undefined,
+  derivedStudyIds: Set<string>,
+): Set<string> {
   const want = new Set<string>();
   for (const d of defs) {
-    if (d.kind === "rsi") continue;
+    if (d.kind === "macd") continue;
+    if (d.kind === "trend_composite" && d.group === "studies") continue;
+    if (d.kind === "talib" && !talibDrawsOnMainPricePane(d)) continue;
+    if (d.kind === "derived" && derivedStudyIds.has(d.id)) continue;
     if (vis[d.id] === false) continue;
-    if (d.kind === "bollinger") {
-      want.add(`${d.id}_upper`);
-      want.add(`${d.id}_mid`);
-      want.add(`${d.id}_lower`);
+    if (d.kind === "talib") {
+      const sub = talibMulti?.[d.id];
+      if (sub && Object.keys(sub).length > 0) {
+        for (const k of Object.keys(sub)) {
+          want.add(`${d.id}__${k}`);
+        }
+      } else {
+        want.add(d.id);
+      }
     } else {
       want.add(d.id);
     }
@@ -364,12 +757,6 @@ function resampleSpreadHistToBarTimes(
   return out;
 }
 
-function emaColor(id: string): string {
-  if (id === "ema8") return "#f59e0b";
-  if (id === "ema21") return "#38bdf8";
-  return "#94a3b8";
-}
-
 function LiveTapeHeatStrip({ ticks }: { ticks: LiveSnapshot["ticks"] }) {
   const ratios = useMemo(() => tapeBuyRatioBuckets(ticks, 40, 40 * 60), [ticks]);
   return (
@@ -399,37 +786,64 @@ export function OhlcvChart({
   indicatorDefs = EMPTY_DEFS,
   indicatorVisibility = EMPTY_VIS,
   liveSnapshot = null,
+  backtestChart = null,
+  backtestStrategyLabel = null,
+  backtestOverlayMode = null,
+  embedBacktestEquityInChart = true,
+  backtestKpiInChart = true,
+  onMainChartApi = undefined,
+  taServerLines,
+  taServerMacd,
+  taServerTalibMulti,
+  featSeries,
+  featVisibility = EMPTY_VIS,
+  footprintBars = null,
 }: Props) {
+  const onMainChartApiRef = useRef<typeof onMainChartApi>(onMainChartApi);
   const outerRef = useRef<HTMLDivElement>(null);
   const mainWrapRef = useRef<HTMLDivElement>(null);
-  const rsiStackRef = useRef<HTMLDivElement>(null);
-  const rsiPlotWrapRef = useRef<HTMLDivElement>(null);
+  const studyChromeStackRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
-  const rsiChartRef = useRef<IChartApi | null>(null);
-  const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
+  const seriesRef = useRef<ISeriesApi<"Candlestick", Time> | null>(null);
+  const seriesMarkersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  const equitySeriesRef = useRef<ISeriesApi<"Line", Time> | null>(null);
   const volRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const liveMidLineRef = useRef<ISeriesApi<"Line"> | null>(null);
   const liveOiLineRef = useRef<ISeriesApi<"Line"> | null>(null);
   const liveSpreadHistRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const liveLiqHistRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const strategyShadingPrimRef = useRef<StrategyShadingBandsPrimitive | null>(null);
   const liqMicroPrimitiveRef = useRef<LiquidationMicroCandlesPrimitive | null>(null);
+  const volumeFootprintPrimitiveRef = useRef<VolumeFootprintPrimitive | null>(null);
   const rsiLineMapRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
+  const macdMacdLineRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
+  const macdSignalLineRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
+  const macdHistRef = useRef<Map<string, ISeriesApi<"Histogram">>>(new Map());
+  const derivedStudyLineRef = useRef<Map<string, ISeriesApi<"Line", Time>>>(new Map());
+  /** Linhas Δ (painel de estudo dedicado); chave ``delta__id`` ou ``delta__id__sub``. */
+  const deltaStudyLineRef = useRef<Map<string, ISeriesApi<"Line" | "Histogram", Time>>>(new Map());
+  const featLineMapRef = useRef<Map<string, ISeriesApi<"Line", Time>>>(new Map());
+  const featPaneHydrateRetriesRef = useRef(0);
+  const featSeriesRef = useRef<Record<string, { time: UTCTimestamp; value: number }[]>>({});
+  const featVisibilityRef = useRef<Record<string, boolean>>(EMPTY_VIS);
   const indLineRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
+  const taHudRef = useRef<TaServerHud>({ lines: {}, macd: {}, talibMulti: {} });
   const prevBarsRef = useRef<CandleApiBar[]>([]);
+  const prevBarsFingerprintRef = useRef("");
   const prevResetKeyRef = useRef(resetKey);
-  /** Evita que um ajuste programático principal→RSI dispare RSI→principal e altere o zoom do principal. */
-  const ignoreRsiToMainRef = useRef(false);
+  const visibleLogicalRangeRef = useRef<LogicalRange | null>(null);
+  /** Se o painel Δ ainda não existe no ``chart``, re-tenta até ``setPaneLayoutRevision`` (troca par/muda painéis). */
+  const derivedPaneHydrateRetriesRef = useRef(0);
+  const deltaPaneHydrateRetriesRef = useRef(0);
   const [dims, setDims] = useState({ w: 800, mainH: 600 });
-  const [timeStrip, setTimeStrip] = useState<{ from: string; to: string }>({ from: "", to: "" });
-  const timeStripPrevRef = useRef({ from: "", to: "" });
   const [crosshairHud, setCrosshairHud] = useState<CrosshairHud | null>(null);
+
+  /** Dispara novo render após sincronizar painéis no ``chart`` (mutação só-JS sem estado). */
+  const [paneLayoutRevision, setPaneLayoutRevision] = useState(0);
 
   const barsRef = useRef(bars);
   const indicatorDefsRef = useRef(indicatorDefs);
   const indicatorVisibilityRef = useRef(indicatorVisibility);
-  barsRef.current = bars;
-  indicatorDefsRef.current = indicatorDefs;
-  indicatorVisibilityRef.current = indicatorVisibility;
 
   /** lightweight-charts dispara o crosshair muitas vezes por segundo; sem isto o React re-renderiza em loop e dispara RAM/CPU (pior com Turbopack). */
   const crosshairRafRef = useRef<number | null>(null);
@@ -440,8 +854,40 @@ export function OhlcvChart({
   const crosshairHudKeyRef = useRef<string>("");
   const indicatorHudEpochRef = useRef(0);
 
-  const processCrosshairRef = useRef<() => void>(() => {});
-  processCrosshairRef.current = () => {
+  const restoreVisibleLogicalRange = useCallback((range: LogicalRange | null) => {
+    if (!range) return;
+    requestAnimationFrame(() => {
+      const chart = chartRef.current;
+      if (!chart) return;
+      try {
+        chart.timeScale().setVisibleLogicalRange({ from: range.from, to: range.to });
+      } catch {
+        /* chart disposed or range invalid during pane sync */
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    onMainChartApiRef.current = onMainChartApi;
+  }, [onMainChartApi]);
+
+  useEffect(() => {
+    taHudRef.current = {
+      lines: taServerLines ?? {},
+      macd: taServerMacd ?? {},
+      talibMulti: taServerTalibMulti ?? {},
+    };
+  }, [taServerLines, taServerMacd, taServerTalibMulti]);
+
+  useEffect(() => {
+    barsRef.current = bars;
+    indicatorDefsRef.current = indicatorDefs;
+    indicatorVisibilityRef.current = indicatorVisibility;
+    featSeriesRef.current = featSeries ?? {};
+    featVisibilityRef.current = featVisibility;
+  }, [bars, indicatorDefs, indicatorVisibility, featSeries, featVisibility]);
+
+  const processCrosshair = useCallback(() => {
     const param = crosshairLatestParamRef.current;
     if (!param) return;
     if (param.point === undefined || param.point === null) {
@@ -479,12 +925,14 @@ export function OhlcvChart({
       month: "2-digit",
       day: "2-digit",
     });
+    const hudTa = taHudRef.current;
     const lines = buildIndicatorHudLines(
       list,
       indicatorDefsRef.current,
       indicatorVisibilityRef.current,
       idx,
-    );
+      hudTa,
+    ).concat(buildFeatHudLines(idx, list, featVisibilityRef.current, featSeriesRef.current));
     setCrosshairHud({
       dateStr,
       o: b.o,
@@ -495,19 +943,26 @@ export function OhlcvChart({
       changePct,
       lines,
     });
-  };
+  }, []);
+
+  const processCrosshairRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    processCrosshairRef.current = processCrosshair;
+  }, [processCrosshair]);
 
   const crosshairCbRef = useRef<
     (param: { time?: unknown; point?: { x: number; y: number } | null }) => void
   >(() => {});
-  crosshairCbRef.current = (param) => {
-    crosshairLatestParamRef.current = param;
-    if (crosshairRafRef.current != null) return;
-    crosshairRafRef.current = requestAnimationFrame(() => {
-      crosshairRafRef.current = null;
-      processCrosshairRef.current();
-    });
-  };
+  useEffect(() => {
+    crosshairCbRef.current = (param) => {
+      crosshairLatestParamRef.current = param;
+      if (crosshairRafRef.current != null) return;
+      crosshairRafRef.current = requestAnimationFrame(() => {
+        crosshairRafRef.current = null;
+        processCrosshairRef.current();
+      });
+    };
+  }, []);
 
   useEffect(() => {
     indicatorHudEpochRef.current += 1;
@@ -516,7 +971,15 @@ export function OhlcvChart({
     if (p?.point != null) {
       processCrosshairRef.current();
     }
-  }, [indicatorDefs, indicatorVisibility]);
+  }, [
+    indicatorDefs,
+    indicatorVisibility,
+    taServerLines,
+    taServerMacd,
+    taServerTalibMulti,
+    featSeries,
+    featVisibility,
+  ]);
 
   useEffect(() => {
     return () => {
@@ -531,16 +994,117 @@ export function OhlcvChart({
   const loadingOlderRef = useRef(!!loadingOlder);
   const onNeedOlderRef = useRef(onNeedOlder);
   const debounceTRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const olderRequestInFlightRef = useRef(false);
+  const olderLoadArmedRef = useRef(true);
+  const suppressAutoOlderLoadUntilRef = useRef(0);
 
   const showRsiPane = useMemo(
-    () => indicatorDefs.some((d) => d.kind === "rsi" && indicatorVisibility[d.id] !== false),
+    () =>
+      indicatorDefs.some((d) => {
+        if (indicatorVisibility[d.id] === false) return false;
+        return talibInRsiStudyPane(d);
+      }),
     [indicatorDefs, indicatorVisibility],
   );
 
   const visibleRsiDefs = useMemo(
-    () => indicatorDefs.filter((d) => d.kind === "rsi" && indicatorVisibility[d.id] !== false),
+    () =>
+      indicatorDefs.filter((d) => {
+        if (indicatorVisibility[d.id] === false) return false;
+        return talibInRsiStudyPane(d);
+      }),
     [indicatorDefs, indicatorVisibility],
   );
+
+  const showMacdPane = useMemo(
+    () =>
+      indicatorDefs.some((d) => {
+        if (indicatorVisibility[d.id] === false) return false;
+        if (d.kind === "macd") return true;
+        if (d.kind === "talib" && d.talibFunction?.toUpperCase() === "MACD") return true;
+        return false;
+      }),
+    [indicatorDefs, indicatorVisibility],
+  );
+
+  const visibleMacdDefs = useMemo(
+    () =>
+      indicatorDefs.filter((d) => {
+        if (indicatorVisibility[d.id] === false) return false;
+        if (d.kind === "macd") return true;
+        if (d.kind === "talib" && d.talibFunction?.toUpperCase() === "MACD") return true;
+        return false;
+      }),
+    [indicatorDefs, indicatorVisibility],
+  );
+
+  const visibleDerivedStudyDefs = useMemo(
+    () =>
+      indicatorDefs.filter((d) => {
+        if (indicatorVisibility[d.id] === false || d.kind !== "derived") return false;
+        return !derivedLooksPriceScaled(d, bars, taServerLines?.[d.id]);
+      }),
+    [indicatorDefs, indicatorVisibility, bars, taServerLines],
+  );
+
+  const derivedStudyIds = useMemo(
+    () => new Set(visibleDerivedStudyDefs.map((d) => d.id)),
+    [visibleDerivedStudyDefs],
+  );
+
+  const showDerivedStudyPane = visibleDerivedStudyDefs.length > 0;
+
+  const derivedStudyPaneIndex = useMemo(
+    () => 1 + (showRsiPane ? 1 : 0) + (showMacdPane ? 1 : 0),
+    [showRsiPane, showMacdPane],
+  );
+
+  const visibleDeltaStudyDefs = useMemo(
+    () =>
+      indicatorDefs.filter(
+        (d) =>
+          indicatorVisibility[d.id] !== false && effectiveDeltaLookbackBars(d) > 0,
+      ),
+    [indicatorDefs, indicatorVisibility],
+  );
+
+  const showDeltaPane = visibleDeltaStudyDefs.length > 0;
+
+  /** Índice do painel apenas-Δ (abaixo de RSI/MACD se existirem). */
+  const deltaStudyPaneIndex = useMemo(
+    () => 1 + (showRsiPane ? 1 : 0) + (showMacdPane ? 1 : 0) + (showDerivedStudyPane ? 1 : 0),
+    [showRsiPane, showMacdPane, showDerivedStudyPane],
+  );
+
+  const visibleFeatEntries = useMemo(
+    () => CHART_FACT_SERIES.filter((e) => featVisibility[e.id] === true),
+    [featVisibility],
+  );
+
+  const showFeatPane = visibleFeatEntries.length > 0;
+
+  /** Facetas QuestDB: painel sob RSI/MACD/Δ. */
+  const featStudyPaneIndex = useMemo(
+    () =>
+      1 +
+      (showRsiPane ? 1 : 0) +
+      (showMacdPane ? 1 : 0) +
+      (showDerivedStudyPane ? 1 : 0) +
+      (showDeltaPane ? 1 : 0),
+    [showRsiPane, showMacdPane, showDerivedStudyPane, showDeltaPane],
+  );
+
+  const showStudyChrome =
+    showRsiPane || showMacdPane || showDerivedStudyPane || showDeltaPane || showFeatPane;
+
+  /** Com RSI / MACD / Δ / facetas num 2.º+ painel, não embutir equity aqui. */
+  const shouldEmbedEquity =
+    embedBacktestEquityInChart &&
+    !showRsiPane &&
+    !showMacdPane &&
+    !showDerivedStudyPane &&
+    !showDeltaPane &&
+    !showFeatPane;
 
   const fitTimeScale = useCallback(() => {
     const chart = chartRef.current;
@@ -550,21 +1114,7 @@ export function OhlcvChart({
     } catch {
       /* ignore */
     }
-    queueMicrotask(() => {
-      const rsi = rsiChartRef.current;
-      if (!rsi || !showRsiPane) return;
-      const br = barsRef.current;
-      const lastT = br.length ? br[br.length - 1].t : null;
-      ignoreRsiToMainRef.current = true;
-      try {
-        safeCopyVisibleTimeRange(chart, rsi, lastT);
-      } finally {
-        window.setTimeout(() => {
-          ignoreRsiToMainRef.current = false;
-        }, 0);
-      }
-    });
-  }, [showRsiPane]);
+  }, []);
 
   const fitPriceScale = useCallback(() => {
     const chart = chartRef.current;
@@ -585,20 +1135,24 @@ export function OhlcvChart({
         /* ignore */
       }
     }
-    const rsi = rsiChartRef.current;
-    if (!rsi || !showRsiPane) return;
+    if (!showStudyChrome) return;
     try {
-      rsi.priceScale("right").applyOptions({
-        autoScale: true,
-        scaleMargins: { ...RSI_PRICE_SCALE_MARGINS },
-      });
+      const n = chart.panes().length;
+      for (let pi = 1; pi < n; pi++) {
+        chart.priceScale("right", pi).applyOptions({
+          autoScale: true,
+          scaleMargins: { ...RSI_PRICE_SCALE_MARGINS },
+        });
+      }
     } catch {
       /* ignore */
     }
-  }, [showRsiPane]);
+  }, [showStudyChrome]);
 
   useEffect(() => {
-    if (bars.length === 0) setCrosshairHud(null);
+    if (bars.length !== 0) return;
+    const raf = requestAnimationFrame(() => setCrosshairHud(null));
+    return () => cancelAnimationFrame(raf);
   }, [bars.length]);
 
   useEffect(() => {
@@ -619,25 +1173,25 @@ export function OhlcvChart({
 
     if (wrap && wrap.clientHeight >= 32) {
       w = Math.max(280, Math.floor(wrap.clientWidth));
-      mainH = Math.max(200, Math.floor(wrap.clientHeight));
+      mainH = Math.max(CHART_VIEWPORT_MIN_PX, Math.floor(wrap.clientHeight));
     } else if (box) {
       w = Math.max(280, Math.floor(box.clientWidth));
       const totalH = Math.floor(box.clientHeight);
       if (totalH < 48) return;
       let studyStrip = 0;
-      if (showRsiPane) {
-        const stack = rsiStackRef.current;
+      if (showStudyChrome) {
+        const stack = studyChromeStackRef.current;
         studyStrip = stack
           ? Math.ceil(stack.getBoundingClientRect().height)
-          : RSI_STACK_TOTAL_PX;
+          : RSI_CHROME_ABOVE_CHART_PX;
       }
-      mainH = Math.max(200, totalH - studyStrip);
+      mainH = Math.max(CHART_VIEWPORT_MIN_PX, totalH - studyStrip);
     } else {
       return;
     }
 
     setDims((prev) => (prev.w === w && prev.mainH === mainH ? prev : { w, mainH }));
-  }, [showRsiPane]);
+  }, [showStudyChrome]);
 
   useLayoutEffect(() => {
     measure();
@@ -650,7 +1204,7 @@ export function OhlcvChart({
     const box = outerRef.current;
     if (wrap) ro.observe(wrap);
     if (box) ro.observe(box);
-    const stack = rsiStackRef.current;
+    const stack = studyChromeStackRef.current;
     if (stack) ro.observe(stack);
     window.addEventListener("resize", measure);
     const raf = requestAnimationFrame(() => measure());
@@ -659,7 +1213,15 @@ export function OhlcvChart({
       ro.disconnect();
       window.removeEventListener("resize", measure);
     };
-  }, [measure, showRsiPane, visibleRsiDefs.length]);
+  }, [
+    measure,
+    showStudyChrome,
+    visibleRsiDefs.length,
+    visibleMacdDefs.length,
+    visibleDerivedStudyDefs.length,
+    visibleDeltaStudyDefs.length,
+    visibleFeatEntries.length,
+  ]);
 
   useEffect(() => {
     const el = mainWrapRef.current;
@@ -667,7 +1229,7 @@ export function OhlcvChart({
 
     const w = Math.max(280, Math.floor(el.clientWidth)) || 800;
     const rawH = Math.floor(el.clientHeight);
-    const h = Math.max(200, rawH >= 32 ? rawH : defaultMainChartHeightPx());
+    const h = Math.max(CHART_VIEWPORT_MIN_PX, rawH >= 32 ? rawH : defaultMainChartHeightPx());
 
     const chart = createChart(el, {
       width: w,
@@ -691,10 +1253,15 @@ export function OhlcvChart({
         ...LINKED_TIME_SCALE,
       },
       rightPriceScale: { borderColor: CHART_BORDER, scaleMargins: { ...MAIN_PRICE_SCALE_MARGINS } },
+      leftPriceScale: {
+        visible: true,
+        borderColor: CHART_BORDER,
+        scaleMargins: { top: 0.12, bottom: 0.2 },
+      },
       ...CHART_INTERACTION,
     });
 
-    const candle = chart.addCandlestickSeries({
+    const candle = chart.addSeries(CandlestickSeries, {
       upColor: "#26a69a",
       downColor: "#ef5350",
       borderVisible: false,
@@ -702,11 +1269,19 @@ export function OhlcvChart({
       wickDownColor: "#ef5350",
     });
 
+    const shadingBands = new StrategyShadingBandsPrimitive();
+    candle.attachPrimitive(shadingBands);
+    strategyShadingPrimRef.current = shadingBands;
+
     const liqMicro = new LiquidationMicroCandlesPrimitive();
     candle.attachPrimitive(liqMicro);
     liqMicroPrimitiveRef.current = liqMicro;
+    const footprint = new VolumeFootprintPrimitive();
+    candle.attachPrimitive(footprint);
+    volumeFootprintPrimitiveRef.current = footprint;
+    seriesMarkersRef.current = createSeriesMarkers(candle, []);
 
-    const vol = chart.addHistogramSeries({
+    const vol = chart.addSeries(HistogramSeries, {
       color: "#5c6bc0",
       priceFormat: { type: "volume" },
       priceScaleId: "vol",
@@ -716,15 +1291,32 @@ export function OhlcvChart({
     chartRef.current = chart;
     seriesRef.current = candle;
     volRef.current = vol;
+    try {
+      onMainChartApiRef.current?.(chart);
+    } catch {
+      /* ignore */
+    }
 
     const onRange = (range: LogicalRange | null) => {
       if (!range || range.from == null) return;
-      if (!hasMoreRef.current || loadingOlderRef.current) return;
-      if (range.from > LOAD_MORE_WHEN_FROM) return;
+      visibleLogicalRangeRef.current = { from: range.from, to: range.to };
+      if (Date.now() < suppressAutoOlderLoadUntilRef.current) {
+        return;
+      }
+      if (range.from > LOAD_MORE_WHEN_FROM + 8) {
+        olderLoadArmedRef.current = true;
+      }
+      if (!hasMoreRef.current || loadingOlderRef.current || olderRequestInFlightRef.current) return;
+      if (range.from > LOAD_MORE_WHEN_FROM || !olderLoadArmedRef.current) return;
       if (debounceTRef.current) clearTimeout(debounceTRef.current);
       debounceTRef.current = setTimeout(() => {
         debounceTRef.current = null;
-        void onNeedOlderRef.current();
+        if (olderRequestInFlightRef.current || loadingOlderRef.current || !hasMoreRef.current) return;
+        olderLoadArmedRef.current = false;
+        olderRequestInFlightRef.current = true;
+        Promise.resolve(onNeedOlderRef.current()).finally(() => {
+          olderRequestInFlightRef.current = false;
+        });
       }, 200);
     };
     chart.timeScale().subscribeVisibleLogicalRangeChange(onRange);
@@ -737,229 +1329,416 @@ export function OhlcvChart({
     };
     chart.subscribeCrosshairMove(onCrosshairMove);
 
+    const indLineMap = indLineRef.current;
+    const rsiLineMap = rsiLineMapRef.current;
+    const derivedStudyLineMap = derivedStudyLineRef.current;
+    const deltaStudyLineMap = deltaStudyLineRef.current;
+    const macdMacdLineMap = macdMacdLineRef.current;
+    const macdSignalLineMap = macdSignalLineRef.current;
+    const macdHistMap = macdHistRef.current;
+    const featLineMap = featLineMapRef.current;
+
     return () => {
-      chart.unsubscribeCrosshairMove(onCrosshairMove);
+      try {
+        onMainChartApiRef.current?.(null);
+      } catch {
+        /* ignore */
+      }
+      if (crosshairRafRef.current != null) {
+        cancelAnimationFrame(crosshairRafRef.current);
+        crosshairRafRef.current = null;
+      }
+      crosshairLatestParamRef.current = null;
+      try {
+        chart.unsubscribeCrosshairMove(onCrosshairMove);
+      } catch {
+        /* chart already disposed */
+      }
       if (debounceTRef.current) clearTimeout(debounceTRef.current);
-      chart.timeScale().unsubscribeVisibleLogicalRangeChange(onRange);
-      const liqPrim = liqMicroPrimitiveRef.current;
-      const candleSer = seriesRef.current;
-      if (liqPrim && candleSer) {
+      try {
+        chart.timeScale().unsubscribeVisibleLogicalRangeChange(onRange);
+      } catch {
+        /* chart already disposed */
+      }
+      const candleSerUnmount = seriesRef.current;
+      const shadeUnmount = strategyShadingPrimRef.current;
+      if (shadeUnmount && candleSerUnmount) {
         try {
-          candleSer.detachPrimitive(liqPrim);
+          candleSerUnmount.detachPrimitive(shadeUnmount);
+        } catch {
+          /* ignore */
+        }
+      }
+      strategyShadingPrimRef.current = null;
+      const liqPrim = liqMicroPrimitiveRef.current;
+      if (liqPrim && candleSerUnmount) {
+        try {
+          candleSerUnmount.detachPrimitive(liqPrim);
         } catch {
           /* ignore */
         }
       }
       liqMicroPrimitiveRef.current = null;
-      // eslint-disable-next-line react-hooks/exhaustive-deps -- snapshot do mapa de séries ao desmontar o gráfico
-      const map = indLineRef.current;
-      for (const s of map.values()) {
+      const fpPrim = volumeFootprintPrimitiveRef.current;
+      if (fpPrim && candleSerUnmount) {
         try {
-          chart.removeSeries(s);
+          candleSerUnmount.detachPrimitive(fpPrim);
         } catch {
           /* ignore */
         }
       }
-      map.clear();
+      volumeFootprintPrimitiveRef.current = null;
+      const mapsToClear = [
+        indLineMap,
+        rsiLineMap,
+        derivedStudyLineMap,
+        deltaStudyLineMap,
+        macdMacdLineMap,
+        macdSignalLineMap,
+        macdHistMap,
+        featLineMap,
+      ];
+      for (const seriesMap of mapsToClear) {
+        for (const s of seriesMap.values()) {
+          try {
+            chart.removeSeries(s);
+          } catch {
+            /* ignore */
+          }
+        }
+        seriesMap.clear();
+      }
       liveMidLineRef.current = null;
       liveOiLineRef.current = null;
       liveSpreadHistRef.current = null;
       liveLiqHistRef.current = null;
-      chart.remove();
+      seriesMarkersRef.current = null;
+      const eq = equitySeriesRef.current;
+      if (eq) {
+        try {
+          chart.removeSeries(eq);
+        } catch {
+          /* ignore */
+        }
+        equitySeriesRef.current = null;
+      }
+      while (true) {
+        try {
+          if (chart.panes().length <= 1) break;
+          chart.removePane(chart.panes().length - 1);
+        } catch {
+          break;
+        }
+      }
       chartRef.current = null;
       seriesRef.current = null;
       volRef.current = null;
+      try {
+        chart.remove();
+      } catch {
+        /* chart already disposed */
+      }
     };
   }, []);
 
   useEffect(() => {
-    chartRef.current?.applyOptions({ width: dims.w, height: dims.mainH });
-    chartRef.current?.timeScale().applyOptions({
-      visible: !showRsiPane,
-      ...LINKED_TIME_SCALE,
-    });
-  }, [dims.w, dims.mainH, showRsiPane]);
+    const mk = seriesMarkersRef.current;
+    if (!mk) return;
+    const raw = backtestChart?.overlay?.markers;
+    try {
+      const bt: SeriesMarker<Time>[] = !raw?.length
+        ? []
+        : raw.map(
+            (m) =>
+              ({
+                time: m.time as Time,
+                position: m.position,
+                color: m.color,
+                shape: m.shape,
+                text: m.text,
+              }) as SeriesMarker<Time>,
+          );
+      mk.setMarkers(bt);
+    } catch {
+      /* gráfico ou série markers já disposed (HMR / desmontagem / troca rápida) */
+    }
+  }, [backtestChart]);
 
   useEffect(() => {
-    if (!showRsiPane) {
-      setTimeStrip({ from: "", to: "" });
-      timeStripPrevRef.current = { from: "", to: "" };
+    const prim = strategyShadingPrimRef.current;
+    if (!prim) return;
+    const sh = backtestChart?.overlay?.strategyShading;
+    if (
+      !sh?.length ||
+      sh.length !== bars.length ||
+      bars.length === 0 ||
+      sh[0]!.t !== bars[0]!.t ||
+      sh[sh.length - 1]!.t !== bars[bars.length - 1]!.t
+    ) {
+      prim.clear();
+      return;
+    }
+    prim.setData(
+      bars.map((b) => b.t),
+      sh,
+    );
+  }, [bars, backtestChart?.overlay?.strategyShading, resetKey]);
+
+  useEffect(() => {
+    const prim = volumeFootprintPrimitiveRef.current;
+    if (!prim || !footprintBars?.length || bars.length === 0) {
+      prim?.clear();
+      return;
+    }
+    prim.setData(
+      bars.map((b) => b.t),
+      footprintBars,
+    );
+  }, [bars, footprintBars, resetKey]);
+
+  useEffect(() => {
+    if (!shouldEmbedEquity) {
+      const ch = chartRef.current;
+      if (!ch) return;
+      const clearOnly = () => {
+        const keepRange = ch.timeScale().getVisibleLogicalRange() ?? visibleLogicalRangeRef.current;
+        const eq = equitySeriesRef.current;
+        if (eq) {
+          try {
+            ch.removeSeries(eq);
+          } catch {
+            /* ignore */
+          }
+          equitySeriesRef.current = null;
+        }
+        // Com RSI num 2.º painel, não derrubar painéis aqui — este efeito volta a correr
+        // (ex.: ``backtestChart``) e apagava o painel do RSI sem o efeito do RSI voltar a criar.
+        if (!showRsiPane && !showMacdPane && !showDerivedStudyPane && !showDeltaPane && !showFeatPane) {
+          while (ch.panes().length > 1) {
+            try {
+              ch.removePane(ch.panes().length - 1);
+            } catch {
+              break;
+            }
+          }
+          try {
+            ch.panes()[0]?.setStretchFactor(1);
+          } catch {
+            /* ignore */
+          }
+        }
+        restoreVisibleLogicalRange(keepRange);
+      };
+      clearOnly();
       return;
     }
     const chart = chartRef.current;
     if (!chart) return;
 
-    const updateStrip = (range: { from: unknown; to: unknown } | null) => {
-      if (range == null || range.from == null || range.to == null) {
-        const empty = { from: "", to: "" };
-        if (timeStripPrevRef.current.from !== "" || timeStripPrevRef.current.to !== "") {
-          timeStripPrevRef.current = empty;
-          setTimeStrip(empty);
-        }
-        return;
-      }
-      const from = formatVisibleTime(range.from);
-      const to = formatVisibleTime(range.to);
-      if (from === timeStripPrevRef.current.from && to === timeStripPrevRef.current.to) return;
-      timeStripPrevRef.current = { from, to };
-      setTimeStrip({ from, to });
-    };
-
-    chart.timeScale().subscribeVisibleTimeRangeChange(updateStrip);
-    queueMicrotask(() => {
-      try {
-        updateStrip(chart.timeScale().getVisibleRange() as { from: unknown; to: unknown } | null);
-      } catch {
-        updateStrip(null);
-      }
-    });
-
-    return () => {
-      chart.timeScale().unsubscribeVisibleTimeRangeChange(updateStrip);
-    };
-  }, [showRsiPane, bars.length]);
-
-  useEffect(() => {
-    if (!showRsiPane) {
-      const rc = rsiChartRef.current;
-      if (rc) {
+    const clearEquityPane = () => {
+      const eq = equitySeriesRef.current;
+      if (eq) {
         try {
-          rc.remove();
+          chart.removeSeries(eq);
         } catch {
           /* ignore */
         }
-        rsiChartRef.current = null;
-        rsiLineMapRef.current.clear();
+        equitySeriesRef.current = null;
       }
+      while (chart.panes().length > 1) {
+        try {
+          chart.removePane(chart.panes().length - 1);
+        } catch {
+          break;
+        }
+      }
+    };
+
+    const eqPoints = backtestChart?.overlay?.equity;
+    if (!eqPoints?.length) {
+      clearEquityPane();
       return;
     }
 
-    const el = rsiPlotWrapRef.current;
-    if (!el) return;
-
-    const cw = Math.floor(el.clientWidth);
-    const w = cw > 0 ? Math.max(280, cw) : 800;
-    const h = RSI_PLOT_HEIGHT_PX;
-
-    const rsiChart = createChart(el, {
-      width: w,
-      height: h,
-      layout: {
-        background: { type: ColorType.Solid, color: CHART_BG },
-        textColor: "#9a9a9e",
-        attributionLogo: false,
-      },
-      grid: {
-        vertLines: { color: CHART_GRID },
-        horzLines: { color: CHART_GRID },
-      },
-      crosshair: { mode: CrosshairMode.Normal },
-      timeScale: {
-        visible: false,
-        timeVisible: true,
-        secondsVisible: false,
-        borderColor: CHART_BORDER,
-        ...LINKED_TIME_SCALE,
-      },
-      rightPriceScale: { borderColor: CHART_BORDER, scaleMargins: { ...RSI_PRICE_SCALE_MARGINS } },
-      ...CHART_INTERACTION,
-    });
-
-    rsiChartRef.current = rsiChart;
-
-    const main = chartRef.current;
-    let lock = false;
-    let clearIgnoreRsiToMainT: number | null = null;
-
-    const lastBarT = () => {
-      const br = barsRef.current;
-      return br.length ? br[br.length - 1].t : null;
-    };
-
-    const pushMainToRsi = () => {
-      if (lock) return;
-      const m = chartRef.current;
-      const rInst = rsiChartRef.current;
-      if (!m || !rInst) return;
-      if (clearIgnoreRsiToMainT != null) window.clearTimeout(clearIgnoreRsiToMainT);
-      ignoreRsiToMainRef.current = true;
-      lock = true;
-      try {
-        safeCopyVisibleTimeRange(m, rInst, lastBarT());
-      } finally {
-        lock = false;
-        clearIgnoreRsiToMainT = window.setTimeout(() => {
-          ignoreRsiToMainRef.current = false;
-          clearIgnoreRsiToMainT = null;
-        }, 0);
-      }
-    };
-
-    const pushRsiToMain = () => {
-      if (lock) return;
-      if (ignoreRsiToMainRef.current) return;
-      const m = chartRef.current;
-      const rInst = rsiChartRef.current;
-      if (!m || !rInst) return;
-      lock = true;
-      try {
-        safeCopyVisibleTimeRange(rInst, m, lastBarT());
-      } finally {
-        lock = false;
-      }
-    };
-
-    const onRsiCrosshairMove = (param: {
-      time?: unknown;
-      point?: { x: number; y: number } | null;
-    }) => {
-      crosshairCbRef.current(param);
-    };
-    rsiChart.subscribeCrosshairMove(onRsiCrosshairMove);
-
-    if (main) {
-      main.timeScale().subscribeVisibleTimeRangeChange(pushMainToRsi);
-      rsiChart.timeScale().subscribeVisibleTimeRangeChange(pushRsiToMain);
-      queueMicrotask(() => {
-        pushMainToRsi();
-      });
+    if (chart.panes().length < 2) {
+      chart.addPane(false);
     }
 
-    return () => {
-      if (clearIgnoreRsiToMainT != null) window.clearTimeout(clearIgnoreRsiToMainT);
-      ignoreRsiToMainRef.current = false;
+    const data = chartTimeSeriesSortedUniqueByTime(
+      eqPoints.map((p) => ({
+        time: p.t as UTCTimestamp,
+        value: p.v,
+      })),
+    );
+
+    if (!equitySeriesRef.current) {
+      equitySeriesRef.current = chart.addSeries(
+        LineSeries,
+        {
+          color: "#a78bfa",
+          lineWidth: 2,
+          priceScaleId: "bt_equity",
+          lastValueVisible: true,
+          priceLineVisible: false,
+          title: "Equity",
+        },
+        1,
+      );
       try {
-        rsiChart.unsubscribeCrosshairMove(onRsiCrosshairMove);
+        chart.priceScale("bt_equity", 1).applyOptions({
+          autoScale: true,
+          borderColor: CHART_BORDER,
+          scaleMargins: { top: 0.1, bottom: 0.08 },
+        });
+        const panes = chart.panes();
+        if (panes[0] && panes[1]) {
+          panes[0].setStretchFactor(0.68);
+          panes[1].setStretchFactor(0.32);
+        }
       } catch {
         /* ignore */
       }
-      const m = chartRef.current;
+    } else {
       try {
-        m?.timeScale().unsubscribeVisibleTimeRangeChange(pushMainToRsi);
-        rsiChart.timeScale().unsubscribeVisibleTimeRangeChange(pushRsiToMain);
+        const panes = chart.panes();
+        if (panes[0] && panes[1]) {
+          panes[0].setStretchFactor(0.68);
+          panes[1].setStretchFactor(0.32);
+        }
       } catch {
         /* ignore */
       }
-      try {
-        rsiChart.remove();
-      } catch {
-        /* ignore */
-      }
-      rsiChartRef.current = null;
-      rsiLineMapRef.current.clear();
-    };
-  }, [showRsiPane]);
+    }
+    equitySeriesRef.current?.setData(data);
+  }, [
+    backtestChart,
+    shouldEmbedEquity,
+    showRsiPane,
+    showMacdPane,
+    showDerivedStudyPane,
+    showDeltaPane,
+    showFeatPane,
+  ]);
 
   useEffect(() => {
-    if (!showRsiPane) return;
-    rsiChartRef.current?.applyOptions({ width: dims.w, height: RSI_PLOT_HEIGHT_PX });
-    rsiChartRef.current?.timeScale().applyOptions({ ...LINKED_TIME_SCALE });
-  }, [dims.w, showRsiPane]);
+    const chart = chartRef.current;
+    if (!chart) return;
+    const keepRange = chart.timeScale().getVisibleLogicalRange() ?? visibleLogicalRangeRef.current;
+    const equityPaneWanted =
+      shouldEmbedEquity && (backtestChart?.overlay?.equity?.length ?? 0) > 0;
+    const studyExtras =
+      (showRsiPane ? 1 : 0) +
+      (showMacdPane ? 1 : 0) +
+      (showDerivedStudyPane ? 1 : 0) +
+      (showDeltaPane ? 1 : 0) +
+      (showFeatPane ? 1 : 0);
+    const want = equityPaneWanted ? 2 : 1 + studyExtras;
+    try {
+      while (chart.panes().length > want && chart.panes().length > 1) {
+        chart.removePane(chart.panes().length - 1);
+      }
+      while (chart.panes().length < want) {
+        chart.addPane(false);
+      }
+      const panes = chart.panes();
+      if (!equityPaneWanted) {
+        if (studyExtras === 0) {
+          panes[0]?.setStretchFactor(1);
+        } else if (studyExtras === 1) {
+          panes[0]?.setStretchFactor(0.72);
+          panes[1]?.setStretchFactor(0.28);
+        } else if (studyExtras === 2) {
+          panes[0]?.setStretchFactor(0.62);
+          panes[1]?.setStretchFactor(0.19);
+          panes[2]?.setStretchFactor(0.19);
+        } else if (studyExtras === 3) {
+          panes[0]?.setStretchFactor(0.55);
+          panes[1]?.setStretchFactor(0.15);
+          panes[2]?.setStretchFactor(0.15);
+          panes[3]?.setStretchFactor(0.15);
+        } else {
+          panes[0]?.setStretchFactor(0.5);
+          panes[1]?.setStretchFactor(0.125);
+          panes[2]?.setStretchFactor(0.125);
+          panes[3]?.setStretchFactor(0.125);
+          panes[4]?.setStretchFactor(0.125);
+        }
+        for (let pi = 1; pi < panes.length; pi++) {
+          chart.priceScale("right", pi).applyOptions({
+            autoScale: true,
+            borderColor: CHART_BORDER,
+            scaleMargins: { ...RSI_PRICE_SCALE_MARGINS },
+          });
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    queueMicrotask(() => {
+      setPaneLayoutRevision((n) => n + 1);
+      restoreVisibleLogicalRange(keepRange);
+    });
+  }, [
+    resetKey,
+    shouldEmbedEquity,
+    backtestChart?.overlay?.equity?.length,
+    showRsiPane,
+    showMacdPane,
+    showDerivedStudyPane,
+    showDeltaPane,
+    showFeatPane,
+  ]);
+
+  useEffect(() => {
+    const ch = chartRef.current;
+    if (!ch) return;
+    try {
+      const keepRange = ch.timeScale().getVisibleLogicalRange() ?? visibleLogicalRangeRef.current;
+      ch.applyOptions({ width: dims.w, height: dims.mainH });
+      ch.timeScale().applyOptions({
+        visible: true,
+        ...LINKED_TIME_SCALE,
+      });
+      restoreVisibleLogicalRange(keepRange);
+    } catch {
+      /* chart disposed */
+    }
+  }, [dims.w, dims.mainH]);
+
+  /** Remove séries RSI quando o painel é desligado (layout de painéis: efeito ``sync`` acima). */
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const clearRsi = () => {
+      for (const [, ser] of [...rsiLineMapRef.current.entries()]) {
+        try {
+          chart.removeSeries(ser);
+        } catch {
+          /* ignore */
+        }
+      }
+      rsiLineMapRef.current.clear();
+    };
+    if (!showRsiPane) {
+      clearRsi();
+      return;
+    }
+    return () => {
+      clearRsi();
+    };
+  }, [showRsiPane]);
 
   useEffect(() => {
     if (resetKey !== prevResetKeyRef.current) {
       prevResetKeyRef.current = resetKey;
       prevBarsRef.current = [];
+      prevBarsFingerprintRef.current = "";
+      olderRequestInFlightRef.current = false;
+      olderLoadArmedRef.current = true;
+      suppressAutoOlderLoadUntilRef.current = 0;
+      derivedPaneHydrateRetriesRef.current = 0;
+      deltaPaneHydrateRetriesRef.current = 0;
+      featPaneHydrateRetriesRef.current = 0;
     }
   }, [resetKey]);
 
@@ -970,6 +1749,8 @@ export function OhlcvChart({
     if (!candle || !vol || !chart) return;
 
     const seriesBars = barsSortedUniqueByTime(bars);
+    const fp = barsDataFingerprint(seriesBars);
+    if (fp === prevBarsFingerprintRef.current) return;
 
     const cdata = seriesBars.map((b) => ({
       time: b.t as import("lightweight-charts").UTCTimestamp,
@@ -992,44 +1773,62 @@ export function OhlcvChart({
       seriesBars.length > prev.length &&
       seriesBars[0].t < prevSeries[0].t;
 
-    if (isPrepend) {
-      const lr = chart.timeScale().getVisibleLogicalRange();
-      candle.setData(cdata);
-      vol.setData(vdata);
-      if (lr) {
+    try {
+      if (isPrepend) {
+        const lr = chart.timeScale().getVisibleLogicalRange();
+        candle.setData(cdata);
+        vol.setData(vdata);
         const delta = seriesBars.length - prevSeries.length;
-        chart.timeScale().setVisibleLogicalRange({
-          from: lr.from + delta,
-          to: lr.to + delta,
+        if (lr && delta > 0) {
+          chart.timeScale().setVisibleLogicalRange({
+            from: lr.from + delta,
+            to: lr.to + delta,
+          });
+        } else if (delta > 0) {
+          /** Sem range antes de ``setData`` — evitar vista em 0..n (dispara histórico sem parar). */
+          const vis = Math.min(FIRST_VIEW_VISIBLE_LOGICAL_BARS, Math.max(96, seriesBars.length));
+          chart.timeScale().setVisibleLogicalRange({
+            from: Math.max(0, seriesBars.length - vis),
+            to: seriesBars.length - 1,
+          });
+        }
+        suppressAutoOlderLoadUntilRef.current = Date.now() + AUTO_OLDER_SUPPRESS_MS;
+      } else {
+        const sameHistoryStart =
+          prevSeries.length > 0 &&
+          seriesBars.length > 0 &&
+          seriesBars[0].t === prevSeries[0].t;
+        candle.setData(cdata);
+        vol.setData(vdata);
+        /** Atualizações live (cauda / mesma vela): não resetar zoom com fitContent. */
+        if (!sameHistoryStart) {
+          const n = seriesBars.length;
+          if (n <= FIRST_VIEW_FULL_FIT_MAX_BARS) {
+            chart.timeScale().fitContent();
+          } else {
+            const vis = Math.min(
+              FIRST_VIEW_VISIBLE_LOGICAL_BARS,
+              Math.max(160, Math.floor(n * 0.42)),
+            );
+            chart.timeScale().setVisibleLogicalRange({
+              from: Math.max(0, n - vis),
+              to: n - 1,
+            });
+          }
+          suppressAutoOlderLoadUntilRef.current = Date.now() + AUTO_OLDER_SUPPRESS_MS;
+        }
+      }
+      if (seriesBars.length > 0) {
+        candle.applyOptions({
+          priceFormat: mainChartPriceFormatFromBars(seriesBars),
         });
       }
-    } else {
-      const sameHistoryStart =
-        prevSeries.length > 0 &&
-        seriesBars.length > 0 &&
-        seriesBars[0].t === prevSeries[0].t;
-      candle.setData(cdata);
-      vol.setData(vdata);
-      /** Atualizações live (cauda / mesma vela): não resetar zoom com fitContent. */
-      if (!sameHistoryStart) {
-        chart.timeScale().fitContent();
-      }
-    }
-
-    const rsiC = rsiChartRef.current;
-    if (rsiC) {
-      const lastT = seriesBars.length ? seriesBars[seriesBars.length - 1].t : null;
-      ignoreRsiToMainRef.current = true;
-      try {
-        safeCopyVisibleTimeRange(chart, rsiC, lastT);
-      } finally {
-        window.setTimeout(() => {
-          ignoreRsiToMainRef.current = false;
-        }, 0);
-      }
+    } catch {
+      /* Object is disposed — evitar crash durante remount/HMR */
     }
 
     prevBarsRef.current = seriesBars;
+    prevBarsFingerprintRef.current = fp;
   }, [bars]);
 
   useEffect(() => {
@@ -1094,7 +1893,7 @@ export function OhlcvChart({
       removeLiqHist();
       liqMicroPrimitiveRef.current?.clear();
       try {
-        candle.setMarkers([]);
+        seriesMarkersRef.current?.setMarkers([]);
       } catch {
         /* ignore */
       }
@@ -1141,7 +1940,7 @@ export function OhlcvChart({
 
     if (midForSet.length > 0) {
       if (!liveMidLineRef.current) {
-        liveMidLineRef.current = chart.addLineSeries({
+        liveMidLineRef.current = chart.addSeries(LineSeries, {
           color: "#22d3ee",
           lineWidth: 2,
           priceScaleId: "right",
@@ -1151,7 +1950,7 @@ export function OhlcvChart({
         });
       }
       liveMidLineRef.current.applyOptions({ color: "#22d3ee", title: "Mid" });
-      liveMidLineRef.current.setData(midForSet);
+      liveMidLineRef.current.setData(chartTimeSeriesSortedUniqueByTime(midForSet));
     } else {
       const mk = Number(liveSnapshot.funding?.mark_price);
       if (Number.isFinite(mk) && liveSnapshot.funding) {
@@ -1161,7 +1960,7 @@ export function OhlcvChart({
         const markForSet = resampleLiveScalarToBarTimes(barList, markRaw);
         if (markForSet.length > 0) {
           if (!liveMidLineRef.current) {
-            liveMidLineRef.current = chart.addLineSeries({
+            liveMidLineRef.current = chart.addSeries(LineSeries, {
               color: "#fbbf24",
               lineWidth: 2,
               priceScaleId: "right",
@@ -1171,7 +1970,7 @@ export function OhlcvChart({
             });
           }
           liveMidLineRef.current.applyOptions({ color: "#fbbf24", title: "Mark" });
-          liveMidLineRef.current.setData(markForSet);
+          liveMidLineRef.current.setData(chartTimeSeriesSortedUniqueByTime(markForSet));
         } else {
           removeMid();
         }
@@ -1200,7 +1999,7 @@ export function OhlcvChart({
         } catch {
           /* ignore */
         }
-        liveOiLineRef.current = chart.addLineSeries({
+        liveOiLineRef.current = chart.addSeries(LineSeries, {
           color: "#c084fc",
           lineWidth: 1,
           priceScaleId: "left",
@@ -1209,7 +2008,7 @@ export function OhlcvChart({
           title: "OI",
         });
       }
-      liveOiLineRef.current.setData(oiForSet);
+      liveOiLineRef.current.setData(chartTimeSeriesSortedUniqueByTime(oiForSet));
     } else {
       removeOi();
     }
@@ -1226,7 +2025,7 @@ export function OhlcvChart({
 
     if (spForSet.length >= 2) {
       if (!liveSpreadHistRef.current) {
-        liveSpreadHistRef.current = chart.addHistogramSeries({
+        liveSpreadHistRef.current = chart.addSeries(HistogramSeries, {
           priceScaleId: "live_spread",
           priceFormat: { type: "price", precision: 8, minMove: 1e-8 },
         });
@@ -1239,7 +2038,7 @@ export function OhlcvChart({
           /* ignore */
         }
       }
-      liveSpreadHistRef.current.setData(spForSet);
+      liveSpreadHistRef.current.setData(chartTimeSeriesSortedUniqueByTime(spForSet));
     } else {
       removeSp();
     }
@@ -1268,7 +2067,7 @@ export function OhlcvChart({
     }
 
     try {
-      candle.setMarkers([]);
+      seriesMarkersRef.current?.setMarkers([]);
     } catch {
       /* ignore */
     }
@@ -1289,7 +2088,7 @@ export function OhlcvChart({
     const map = indLineRef.current;
     const defs = indicatorDefs;
     const vis = indicatorVisibility;
-    const want = collectMainLineKeys(defs, vis);
+    const want = collectMainLineKeys(defs, vis, taServerTalibMulti, derivedStudyIds);
 
     for (const [key, ser] of [...map.entries()]) {
       if (!want.has(key)) {
@@ -1302,18 +2101,20 @@ export function OhlcvChart({
       }
     }
 
+    let hasAtr = false;
     for (const d of defs) {
-      if (d.kind === "rsi" || vis[d.id] === false) continue;
+      if (d.kind === "macd" || vis[d.id] === false) continue;
+      if (d.kind === "trend_composite" && d.group === "studies") continue;
+      if (d.kind === "talib" && !talibDrawsOnMainPricePane(d)) continue;
+      if (d.kind === "derived" && derivedStudyIds.has(d.id)) continue;
 
-      const barSeries = barsAsSourceSeries(bars, d.source ?? "close");
-
-      if (d.kind === "ema") {
-        const period = d.period ?? 14;
-        const lineColor = d.color ?? emaColor(d.id);
+      if (d.kind === "sma") {
+        const lineColor = d.color ?? "#c4b5fd";
         const lineWidth = d.lineWidth ?? 2;
+        const data = chartTimeSeriesSortedUniqueByTime(taServerLines?.[d.id] ?? []);
         let ser = map.get(d.id);
         if (!ser) {
-          ser = chart.addLineSeries({
+          ser = chart.addSeries(LineSeries, {
             color: lineColor,
             lineWidth,
             priceScaleId: "right",
@@ -1323,72 +2124,130 @@ export function OhlcvChart({
           map.set(d.id, ser);
         }
         ser.applyOptions({ color: lineColor, lineWidth });
-        ser.setData(emaSeries(barSeries, period));
-      } else if (d.kind === "bollinger") {
-        const period = d.period ?? 20;
-        const mult = d.mult ?? 2;
-        const { upper, mid, lower } = bollingerSeries(barSeries, period, mult);
-
-        const ensure = (
-          key: string,
-          opts: {
-            color: string;
-            lineWidth: 1 | 2 | 3 | 4;
-            lineStyle?: LineStyle;
-          },
-        ) => {
-          let ser = map.get(key);
+        ser.setData(data);
+      } else if (d.kind === "atr") {
+        hasAtr = true;
+        const lineColor = d.color ?? "#fb923c";
+        const lineWidth = d.lineWidth ?? 2;
+        const data = chartTimeSeriesSortedUniqueByTime(taServerLines?.[d.id] ?? []);
+        let ser = map.get(d.id);
+        if (!ser) {
+          ser = chart.addSeries(LineSeries, {
+            color: lineColor,
+            lineWidth,
+            priceScaleId: "left",
+            lastValueVisible: true,
+            priceLineVisible: false,
+          });
+          map.set(d.id, ser);
+        }
+        ser.applyOptions({ color: lineColor, lineWidth });
+        ser.setData(data);
+      } else if (d.kind === "derived") {
+        const lineColor = d.color ?? "#f472b6";
+        const lineWidth = d.lineWidth ?? 2;
+        const data = chartTimeSeriesSortedUniqueByTime(taServerLines?.[d.id] ?? []);
+        let ser = map.get(d.id);
+        if (!ser) {
+          ser = chart.addSeries(LineSeries, {
+            color: lineColor,
+            lineWidth,
+            priceScaleId: "right",
+            lastValueVisible: true,
+            priceLineVisible: false,
+          });
+          map.set(d.id, ser);
+        }
+        ser.applyOptions({ color: lineColor, lineWidth });
+        ser.setData(data);
+      } else if (d.kind === "talib") {
+        const palette = ["#38bdf8", "#a78bfa", "#f472b6", "#fbbf24", "#4ade80"];
+        const multi = taServerTalibMulti?.[d.id];
+        if (multi && Object.keys(multi).length > 0) {
+          const keys = Object.keys(multi).sort();
+          keys.forEach((oname, idx) => {
+            const fullKey = `${d.id}__${oname}`;
+            const data = chartTimeSeriesSortedUniqueByTime(multi[oname] ?? []);
+            const lineColor = palette[idx % palette.length];
+            const lineWidth = d.lineWidth ?? 2;
+            let ser = map.get(fullKey);
+            if (!ser) {
+              ser = chart.addSeries(LineSeries, {
+                color: lineColor,
+                lineWidth,
+                priceScaleId: "right",
+                lastValueVisible: true,
+                priceLineVisible: false,
+              });
+              map.set(fullKey, ser);
+            }
+            ser.applyOptions({ color: lineColor, lineWidth });
+            ser.setData(data);
+          });
+        } else {
+          const lineColor = d.color ?? "#38bdf8";
+          const lineWidth = d.lineWidth ?? 2;
+          const data = chartTimeSeriesSortedUniqueByTime(taServerLines?.[d.id] ?? []);
+          let ser = map.get(d.id);
           if (!ser) {
-            ser = chart.addLineSeries({
-              color: opts.color,
-              lineWidth: opts.lineWidth,
-              lineStyle: opts.lineStyle ?? LineStyle.Solid,
+            ser = chart.addSeries(LineSeries, {
+              color: lineColor,
+              lineWidth,
               priceScaleId: "right",
-              lastValueVisible: false,
+              lastValueVisible: true,
               priceLineVisible: false,
             });
-            map.set(key, ser);
+            map.set(d.id, ser);
           }
-          return ser;
-        };
-
-        const cU = d.colorUpper ?? "#71717a";
-        const cM = d.colorMid ?? "#a1a1aa";
-        const cL = d.colorLower ?? "#71717a";
-        const lineWidth = d.lineWidth ?? 1;
-
-        const sU = ensure(`${d.id}_upper`, { color: cU, lineWidth, lineStyle: LineStyle.Dashed });
-        sU.applyOptions({ color: cU, lineWidth, lineStyle: LineStyle.Dashed });
-        sU.setData(upper);
-
-        const sM = ensure(`${d.id}_mid`, { color: cM, lineWidth });
-        sM.applyOptions({ color: cM, lineWidth, lineStyle: LineStyle.Solid });
-        sM.setData(mid);
-
-        const sL = ensure(`${d.id}_lower`, { color: cL, lineWidth, lineStyle: LineStyle.Dashed });
-        sL.applyOptions({ color: cL, lineWidth, lineStyle: LineStyle.Dashed });
-        sL.setData(lower);
+          ser.applyOptions({ color: lineColor, lineWidth });
+          ser.setData(data);
+        }
       }
+    }
+
+    try {
+      chart.priceScale("left").applyOptions({
+        visible: hasAtr,
+        autoScale: true,
+        borderColor: CHART_BORDER,
+        scaleMargins: { top: 0.12, bottom: 0.2 },
+      });
+    } catch {
+      /* ignore */
     }
 
     chart.priceScale("right").applyOptions({
       scaleMargins: { ...MAIN_PRICE_SCALE_MARGINS },
     });
-  }, [bars, indicatorDefs, indicatorVisibility]);
+  }, [resetKey, bars, indicatorDefs, indicatorVisibility, taServerLines, taServerTalibMulti, derivedStudyIds]);
 
   useEffect(() => {
     if (!showRsiPane) return;
-    const rsiChart = rsiChartRef.current;
-    if (!rsiChart) return;
+    const chart = chartRef.current;
+    if (!chart) return;
+    if (chart.panes().length < 2) return;
 
     const map = rsiLineMapRef.current;
-    const defs = indicatorDefs.filter((d) => d.kind === "rsi" && indicatorVisibility[d.id] !== false);
-    const want = new Set(defs.map((d) => d.id));
+    const defs = indicatorDefs.filter((d) => {
+      if (indicatorVisibility[d.id] === false) return false;
+      return talibInRsiStudyPane(d);
+    });
+    const want = new Set<string>();
+    for (const d of defs) {
+      const multi = taServerTalibMulti?.[d.id];
+      if (d.kind === "talib" && multi && Object.keys(multi).length > 0) {
+        for (const k of Object.keys(multi).sort()) {
+          want.add(`${d.id}__${k}`);
+        }
+      } else {
+        want.add(d.id);
+      }
+    }
 
     for (const [id, ser] of [...map.entries()]) {
       if (!want.has(id)) {
         try {
-          rsiChart.removeSeries(ser);
+          chart.removeSeries(ser);
         } catch {
           /* ignore */
         }
@@ -1396,40 +2255,643 @@ export function OhlcvChart({
       }
     }
 
+    const palette = ["#38bdf8", "#a78bfa", "#f472b6", "#fbbf24", "#4ade80"];
     defs.forEach((d) => {
-      const period = d.period ?? 14;
-      const lineColor = effectiveRsiLineColor(d.id, d.color);
       const lineWidth = d.lineWidth ?? 2;
-      const barSeries = barsAsSourceSeries(bars, d.source ?? "close");
+      const multi = taServerTalibMulti?.[d.id];
+      if (d.kind === "talib" && multi && Object.keys(multi).length > 0) {
+        const keys = Object.keys(multi).sort();
+        keys.forEach((oname, idx) => {
+          const fullKey = `${d.id}__${oname}`;
+          const data = chartTimeSeriesSortedUniqueByTime(multi[oname] ?? []);
+          const lineColor = palette[idx % palette.length];
+          let ser = map.get(fullKey);
+          if (!ser) {
+            ser = chart.addSeries(
+              LineSeries,
+              {
+                color: lineColor,
+                lineWidth,
+                lastValueVisible: true,
+                priceLineVisible: false,
+                priceScaleId: "right",
+              },
+              1,
+            );
+            map.set(fullKey, ser);
+          }
+          ser.applyOptions({ color: lineColor, lineWidth });
+          ser.setData(data);
+          applyStudyPriceFormatFromValues(ser, data.map((p) => p.value));
+        });
+        return;
+      }
       let ser = map.get(d.id);
       if (!ser) {
-        ser = rsiChart.addLineSeries({
-          color: lineColor,
-          lineWidth,
-          lastValueVisible: true,
-          priceLineVisible: false,
+        ser = chart.addSeries(
+          LineSeries,
+          {
+            color: "#94a3b8",
+            lineWidth,
+            lastValueVisible: true,
+            priceLineVisible: false,
+            priceScaleId: "right",
+          },
+          1,
+        );
+        map.set(d.id, ser);
+      }
+      const lineColor = d.color ?? "#38bdf8";
+      const data = chartTimeSeriesSortedUniqueByTime(taServerLines?.[d.id] ?? []);
+      ser.applyOptions({ color: lineColor, lineWidth });
+      ser.setData(data);
+      applyStudyPriceFormatFromValues(ser, data.map((p) => p.value));
+    });
+  }, [resetKey, indicatorDefs, indicatorVisibility, showRsiPane, taServerLines, taServerTalibMulti]);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+
+    const dropMacdId = (id: string) => {
+      const serM = macdMacdLineRef.current.get(id);
+      if (serM) {
+        try {
+          chart.removeSeries(serM);
+        } catch {
+          /* ignore */
+        }
+        macdMacdLineRef.current.delete(id);
+      }
+      const serS = macdSignalLineRef.current.get(id);
+      if (serS) {
+        try {
+          chart.removeSeries(serS);
+        } catch {
+          /* ignore */
+        }
+        macdSignalLineRef.current.delete(id);
+      }
+      const serH = macdHistRef.current.get(id);
+      if (serH) {
+        try {
+          chart.removeSeries(serH);
+        } catch {
+          /* ignore */
+        }
+        macdHistRef.current.delete(id);
+      }
+    };
+
+    if (!showMacdPane) {
+      for (const id of [...macdMacdLineRef.current.keys()]) dropMacdId(id);
+      return;
+    }
+
+    const macdPane = showRsiPane ? 2 : 1;
+    if (chart.panes().length <= macdPane) return;
+
+    const defs = indicatorDefs.filter((d) => {
+      if (indicatorVisibility[d.id] === false) return false;
+      if (d.kind === "macd") return true;
+      if (d.kind === "talib" && d.talibFunction?.toUpperCase() === "MACD") return true;
+      return false;
+    });
+    const want = new Set(defs.map((d) => d.id));
+    for (const id of [...macdMacdLineRef.current.keys()]) {
+      if (!want.has(id)) dropMacdId(id);
+    }
+
+    const bundles = taServerMacd ?? {};
+
+    defs.forEach((d) => {
+      const b = bundles[d.id];
+      if (!b?.macd?.length) {
+        dropMacdId(d.id);
+        return;
+      }
+      const cM = d.color ?? "#22d3ee";
+      const lw = d.lineWidth ?? 2;
+
+      let serM = macdMacdLineRef.current.get(d.id);
+      if (!serM) {
+        serM = chart.addSeries(
+          LineSeries,
+          {
+            color: cM,
+            lineWidth: lw,
+            lastValueVisible: true,
+            priceLineVisible: false,
+            priceScaleId: "right",
+          },
+          macdPane,
+        );
+        macdMacdLineRef.current.set(d.id, serM);
+      }
+      const macdPts = chartTimeSeriesSortedUniqueByTime(b.macd);
+      const sigPts = chartTimeSeriesSortedUniqueByTime(b.signal);
+      const histPts = chartTimeSeriesSortedUniqueByTime(b.histogram);
+      const macdFmt = studyPriceFormatFromNumericSamples([
+        ...macdPts.map((p) => p.value),
+        ...sigPts.map((p) => p.value),
+        ...histPts.map((p) => p.value),
+      ]);
+
+      serM.applyOptions({ color: cM, lineWidth: lw, priceFormat: macdFmt });
+      serM.setData(macdPts);
+
+      let serS = macdSignalLineRef.current.get(d.id);
+      if (!serS) {
+        serS = chart.addSeries(
+          LineSeries,
+          {
+            color: "#a78bfa",
+            lineWidth: lw,
+            lastValueVisible: false,
+            priceLineVisible: false,
+            priceScaleId: "right",
+          },
+          macdPane,
+        );
+        macdSignalLineRef.current.set(d.id, serS);
+      }
+      serS.applyOptions({ lineWidth: lw, priceFormat: macdFmt });
+      serS.setData(sigPts);
+
+      let serH = macdHistRef.current.get(d.id);
+      if (!serH) {
+        serH = chart.addSeries(
+          HistogramSeries,
+          {
+            priceScaleId: "right",
+            priceFormat: macdFmt,
+          },
+          macdPane,
+        );
+        macdHistRef.current.set(d.id, serH);
+      }
+      serH.applyOptions({ priceFormat: macdFmt });
+      serH.setData(histPts);
+    });
+  }, [resetKey, showMacdPane, showRsiPane, indicatorDefs, indicatorVisibility, taServerMacd]);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const map = derivedStudyLineRef.current;
+    if (map.size === 0) return;
+    for (const ser of map.values()) {
+      try {
+        chart.removeSeries(ser);
+      } catch {
+        /* série ou painel já recriado */
+      }
+    }
+    map.clear();
+    derivedPaneHydrateRetriesRef.current = 0;
+  }, [resetKey]);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    const map = derivedStudyLineRef.current;
+    if (!chart) return;
+
+    const clearAll = () => {
+      for (const [, ser] of [...map.entries()]) {
+        try {
+          chart.removeSeries(ser);
+        } catch {
+          /* ignore */
+        }
+      }
+      map.clear();
+    };
+
+    if (!showDerivedStudyPane) {
+      clearAll();
+      derivedPaneHydrateRetriesRef.current = 0;
+      return;
+    }
+
+    if (chart.panes().length <= derivedStudyPaneIndex) {
+      if (derivedPaneHydrateRetriesRef.current < 20) {
+        derivedPaneHydrateRetriesRef.current += 1;
+        queueMicrotask(() => {
+          setPaneLayoutRevision((n) => n + 1);
         });
+      }
+      return;
+    }
+    derivedPaneHydrateRetriesRef.current = 0;
+
+    const want = new Set(visibleDerivedStudyDefs.map((d) => d.id));
+    for (const id of [...map.keys()]) {
+      if (want.has(id)) continue;
+      const ser = map.get(id);
+      if (ser) {
+        try {
+          chart.removeSeries(ser);
+        } catch {
+          /* ignore */
+        }
+      }
+      map.delete(id);
+    }
+
+    for (const d of visibleDerivedStudyDefs) {
+      const data = chartTimeSeriesSortedUniqueByTime(taServerLines?.[d.id] ?? []);
+      const lineColor = d.color ?? "#f472b6";
+      const lineWidth = d.lineWidth ?? 2;
+      let ser = map.get(d.id);
+      if (!ser) {
+        ser = chart.addSeries(
+          LineSeries,
+          {
+            color: lineColor,
+            lineWidth,
+            lastValueVisible: true,
+            priceLineVisible: false,
+            priceScaleId: "right",
+          },
+          derivedStudyPaneIndex,
+        );
         map.set(d.id, ser);
       }
       ser.applyOptions({ color: lineColor, lineWidth });
-      ser.setData(rsiSeries(barSeries, period));
-    });
+      ser.setData(data);
+      applyStudyPriceFormatFromValues(ser, data.map((p) => p.value));
+    }
+  }, [
+    resetKey,
+    paneLayoutRevision,
+    showDerivedStudyPane,
+    derivedStudyPaneIndex,
+    visibleDerivedStudyDefs,
+    taServerLines,
+  ]);
 
-    queueMicrotask(() => {
-      const main = chartRef.current;
-      const rsi = rsiChartRef.current;
-      if (!main || !rsi) return;
-      const lastT = bars.length ? bars[bars.length - 1].t : null;
-      ignoreRsiToMainRef.current = true;
+  /** Ao mudar par/reset, remove séries Δ antigas (referências inválidas depois de ``removePane`` no sync). */
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const map = deltaStudyLineRef.current;
+    if (map.size === 0) return;
+    for (const ser of map.values()) {
       try {
-        safeCopyVisibleTimeRange(main, rsi, lastT);
-      } finally {
-        window.setTimeout(() => {
-          ignoreRsiToMainRef.current = false;
-        }, 0);
+        chart.removeSeries(ser);
+      } catch {
+        /* série ou painel já recriado */
       }
-    });
-  }, [bars, indicatorDefs, indicatorVisibility, showRsiPane]);
+    }
+    map.clear();
+    deltaPaneHydrateRetriesRef.current = 0;
+  }, [resetKey]);
+
+  /** Painel apenas com linhas Δ (abaixo dos outros estudos). */
+  useEffect(() => {
+    const chart = chartRef.current;
+    const map = deltaStudyLineRef.current;
+    if (!chart) return;
+
+    const clearOrphans = (wantKeys: Set<string>) => {
+      for (const key of [...map.keys()]) {
+        if (wantKeys.has(key)) continue;
+        const ser = map.get(key);
+        if (ser) {
+          try {
+            chart.removeSeries(ser);
+          } catch {
+            /* ignore */
+          }
+        }
+        map.delete(key);
+      }
+    };
+
+    const ensureLine = (
+      key: string,
+      color: string,
+      lw: 1 | 2 | 3 | 4,
+      paneIdx: number,
+    ): ISeriesApi<"Line", Time> => {
+      let ser = map.get(key);
+      const st =
+        ser && typeof (ser as { seriesType?: () => string }).seriesType === "function"
+          ? (ser as { seriesType: () => string }).seriesType()
+          : "";
+      if (ser && st !== "Line") {
+        try {
+          chart.removeSeries(ser);
+        } catch {
+          /* ignore */
+        }
+        map.delete(key);
+        ser = undefined;
+      }
+      if (!ser) {
+        ser = chart.addSeries(
+          LineSeries,
+          {
+            color,
+            lineWidth: lw,
+            priceScaleId: "right",
+            lastValueVisible: true,
+            priceLineVisible: false,
+          },
+          paneIdx,
+        );
+        map.set(key, ser);
+      } else {
+        ser.applyOptions({
+          color,
+          lineWidth: lw,
+        } satisfies Parameters<ISeriesApi<"Line">["applyOptions"]>[0]);
+      }
+      return ser as ISeriesApi<"Line", Time>;
+    };
+
+    const ensureHist = (
+      key: string,
+      paneIdx: number,
+    ): ISeriesApi<"Histogram", Time> => {
+      let ser = map.get(key);
+      const st =
+        ser && typeof (ser as { seriesType?: () => string }).seriesType === "function"
+          ? (ser as { seriesType: () => string }).seriesType()
+          : "";
+      if (ser && st !== "Histogram") {
+        try {
+          chart.removeSeries(ser);
+        } catch {
+          /* ignore */
+        }
+        map.delete(key);
+        ser = undefined;
+      }
+      if (!ser) {
+        ser = chart.addSeries(
+          HistogramSeries,
+          {
+            priceScaleId: "right",
+          },
+          paneIdx,
+        );
+        map.set(key, ser);
+      }
+      return ser as ISeriesApi<"Histogram", Time>;
+    };
+
+    const wantKeys = new Set<string>();
+
+    if (!showDeltaPane) {
+      clearOrphans(wantKeys);
+      return;
+    }
+
+    /** Painel Índice ``deltaStudyPaneIndex`` ainda não existe (ordem dos efeitos / ``addPane``). Re-dispara render limitado. */
+    if (chart.panes().length <= deltaStudyPaneIndex) {
+      if (deltaPaneHydrateRetriesRef.current < 20) {
+        deltaPaneHydrateRetriesRef.current += 1;
+        queueMicrotask(() => {
+          setPaneLayoutRevision((n) => n + 1);
+        });
+      }
+      return;
+    }
+    deltaPaneHydrateRetriesRef.current = 0;
+
+    const dpi = deltaStudyPaneIndex;
+    const defs = indicatorDefs;
+    const vis = indicatorVisibility;
+
+    try {
+      for (const d of defs) {
+        if (vis[d.id] === false) continue;
+        if (effectiveDeltaLookbackBars(d) < 1) continue;
+
+        const taLn = taServerLines?.[d.id];
+        const taMac = taServerMacd?.[d.id];
+        const taMulti = taServerTalibMulti?.[d.id];
+
+        if (d.kind === "sma" && taLn?.length) {
+          const k = `Δ::${d.id}`;
+          wantKeys.add(k);
+          const pts = chartTimeSeriesSortedUniqueByTime(maybeApplyIndicatorDeltaSeries(d, bars, taLn));
+          const ser = ensureLine(k, d.color ?? "#c4b5fd", d.lineWidth ?? 2, dpi);
+          ser.setData(pts);
+          applyStudyPriceFormatFromValues(ser, pts.map((p) => p.value));
+          continue;
+        }
+
+        if (d.kind === "atr" && taLn?.length) {
+          const k = `Δ::${d.id}`;
+          wantKeys.add(k);
+          const pts = chartTimeSeriesSortedUniqueByTime(maybeApplyIndicatorDeltaSeries(d, bars, taLn));
+          const ser = ensureLine(k, d.color ?? "#fb923c", d.lineWidth ?? 2, dpi);
+          ser.setData(pts);
+          applyStudyPriceFormatFromValues(ser, pts.map((p) => p.value));
+          continue;
+        }
+
+        if (d.kind === "macd" && taMac?.macd?.length) {
+          const kM = `Δ::${d.id}::m`;
+          const kS = `Δ::${d.id}::s`;
+          const kH = `Δ::${d.id}::h`;
+          wantKeys.add(kM);
+          wantKeys.add(kS);
+          wantKeys.add(kH);
+          const cM = d.color ?? "#22d3ee";
+          const lw = d.lineWidth ?? 2;
+          const ptsM = chartTimeSeriesSortedUniqueByTime(maybeApplyIndicatorDeltaSeries(d, bars, taMac.macd));
+          const serM = ensureLine(kM, cM, lw, dpi);
+          serM.setData(ptsM);
+          applyStudyPriceFormatFromValues(serM, ptsM.map((p) => p.value));
+          const ptsS = chartTimeSeriesSortedUniqueByTime(maybeApplyIndicatorDeltaSeries(d, bars, taMac.signal));
+          const serS = ensureLine(kS, "#a78bfa", lw, dpi);
+          serS.setData(ptsS);
+          applyStudyPriceFormatFromValues(serS, ptsS.map((p) => p.value));
+          const histPts = taMac.histogram.map((p) => ({ time: p.time, value: p.value }));
+          const dh = chartTimeSeriesSortedUniqueByTime(maybeApplyIndicatorDeltaSeries(d, bars, histPts));
+          const serH = ensureHist(kH, dpi);
+          serH.setData(
+            dh.map((pt) => ({
+              time: pt.time,
+              value: pt.value,
+              color: deltaHistogramColor(pt.value),
+            })),
+          );
+          applyStudyPriceFormatFromValues(serH, dh.map((p) => p.value));
+          continue;
+        }
+
+        if (d.kind === "talib") {
+          if (taMac?.macd?.length && d.talibFunction?.toUpperCase() === "MACD") {
+            const kM = `Δ::${d.id}::tm`;
+            const kS = `Δ::${d.id}::ts`;
+            const kH = `Δ::${d.id}::th`;
+            wantKeys.add(kM);
+            wantKeys.add(kS);
+            wantKeys.add(kH);
+            const cM = d.color ?? "#22d3ee";
+            const lw = d.lineWidth ?? 2;
+            const ptsM = chartTimeSeriesSortedUniqueByTime(maybeApplyIndicatorDeltaSeries(d, bars, taMac.macd));
+            const serM = ensureLine(kM, cM, lw, dpi);
+            serM.setData(ptsM);
+            applyStudyPriceFormatFromValues(serM, ptsM.map((p) => p.value));
+            const ptsS = chartTimeSeriesSortedUniqueByTime(maybeApplyIndicatorDeltaSeries(d, bars, taMac.signal));
+            const serS = ensureLine(kS, "#a78bfa", lw, dpi);
+            serS.setData(ptsS);
+            applyStudyPriceFormatFromValues(serS, ptsS.map((p) => p.value));
+            const histPts = taMac.histogram.map((p) => ({ time: p.time, value: p.value }));
+            const dh = chartTimeSeriesSortedUniqueByTime(maybeApplyIndicatorDeltaSeries(d, bars, histPts));
+            const serH = ensureHist(kH, dpi);
+            serH.setData(
+              dh.map((pt) => ({
+                time: pt.time,
+                value: pt.value,
+                color: deltaHistogramColor(pt.value),
+              })),
+            );
+            applyStudyPriceFormatFromValues(serH, dh.map((p) => p.value));
+            continue;
+          }
+          if (taMulti && Object.keys(taMulti).length > 0) {
+            const keys = Object.keys(taMulti).sort();
+            const palette = ["#38bdf8", "#a78bfa", "#f472b6", "#fbbf24", "#4ade80"];
+            let idx = 0;
+            for (const oname of keys) {
+              const line = taMulti[oname];
+              if (!line?.length) continue;
+              const k = `Δ::${d.id}::${oname}`;
+              wantKeys.add(k);
+            const pts = chartTimeSeriesSortedUniqueByTime(maybeApplyIndicatorDeltaSeries(d, bars, line));
+              const ser = ensureLine(
+                k,
+                palette[idx % palette.length]!,
+                d.lineWidth ?? 2,
+                dpi,
+              );
+              ser.setData(pts);
+              applyStudyPriceFormatFromValues(ser, pts.map((p) => p.value));
+              idx++;
+            }
+            continue;
+          }
+          if (taLn?.length) {
+            const k = `Δ::${d.id}`;
+            wantKeys.add(k);
+            const pts = chartTimeSeriesSortedUniqueByTime(maybeApplyIndicatorDeltaSeries(d, bars, taLn));
+            const ser = ensureLine(k, d.color ?? "#38bdf8", d.lineWidth ?? 2, dpi);
+            ser.setData(pts);
+            applyStudyPriceFormatFromValues(ser, pts.map((p) => p.value));
+          }
+        }
+      }
+      clearOrphans(wantKeys);
+    } catch {
+      /* erro intermédio: não limpar Δ com ``wantKeys`` incompleto */
+    }
+  }, [
+    resetKey,
+    paneLayoutRevision,
+    showDeltaPane,
+    deltaStudyPaneIndex,
+    bars,
+    indicatorDefs,
+    indicatorVisibility,
+    taServerLines,
+    taServerMacd,
+    taServerTalibMulti,
+  ]);
+
+  /** Facetas QuestDB: linhas num painel de estudo (API Python já agregou por vela). */
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+
+    const clearAll = () => {
+      for (const [, ser] of [...featLineMapRef.current.entries()]) {
+        try {
+          chart.removeSeries(ser);
+        } catch {
+          /* ignore */
+        }
+      }
+      featLineMapRef.current.clear();
+    };
+
+    if (!showFeatPane) {
+      clearAll();
+      return;
+    }
+
+    /** Painel de facetas só existe em ``sync`` de layout; mesmo padrão que Δ. */
+    if (chart.panes().length <= featStudyPaneIndex) {
+      if (featPaneHydrateRetriesRef.current < 20) {
+        featPaneHydrateRetriesRef.current += 1;
+        queueMicrotask(() => {
+          setPaneLayoutRevision((n) => n + 1);
+        });
+      }
+      return;
+    }
+    featPaneHydrateRetriesRef.current = 0;
+
+    const pi = featStudyPaneIndex;
+    const map = featLineMapRef.current;
+    const fs = featSeries ?? {};
+    const want = new Set<string>();
+
+    try {
+      for (const e of CHART_FACT_SERIES) {
+        if (featVisibility[e.id] !== true) continue;
+        want.add(e.id);
+        let ser = map.get(e.id);
+        const pf = featSeriesPriceFormat(e.id);
+        const data = chartTimeSeriesSortedUniqueByTime(fs[e.id] ?? []);
+        if (!ser) {
+          ser = chart.addSeries(
+            LineSeries,
+            {
+              color: e.color,
+              lineWidth: 2,
+              priceScaleId: "right",
+              lastValueVisible: true,
+              priceLineVisible: false,
+              priceFormat: pf,
+            },
+            pi,
+          );
+          map.set(e.id, ser);
+        } else {
+          ser.applyOptions({
+            color: e.color,
+            priceFormat: pf,
+          } satisfies Parameters<ISeriesApi<"Line", Time>["applyOptions"]>[0]);
+        }
+        ser.setData(data);
+      }
+      for (const [fid, Ser] of [...map.entries()]) {
+        if (!want.has(fid)) {
+          try {
+            chart.removeSeries(Ser);
+          } catch {
+            /* ignore */
+          }
+          map.delete(fid);
+        }
+      }
+    } catch {
+      /* série/painéis em estado intermédio */
+    }
+  }, [
+    resetKey,
+    paneLayoutRevision,
+    showFeatPane,
+    featStudyPaneIndex,
+    featSeries,
+    featVisibility,
+  ]);
 
   return (
     <div className="flex min-h-0 w-full min-w-0 flex-1 flex-col gap-1 overflow-hidden">
@@ -1442,6 +2904,71 @@ export function OhlcvChart({
         ref={outerRef}
         className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-zinc-900/95 bg-[#050506] shadow-inner shadow-black/30"
       >
+        {backtestChart && backtestKpiInChart ? (
+          <div className="shrink-0 border-b border-zinc-800/90 bg-gradient-to-b from-violet-950/20 to-[#08080a] px-2 py-1.5">
+            <div className="flex min-h-[1.25rem] flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] leading-tight sm:text-[11px]">
+              <span
+                className="shrink-0 text-[9px] font-semibold uppercase tracking-wide text-violet-400/90"
+                title="B/S = entradas (verde/vermelho); fechos com etiqueta C ou S = âmbar; equity abaixo"
+              >
+                {backtestStrategyLabel?.trim()
+                  ? `${backtestStrategyLabel.trim()} — ${
+                      backtestOverlayMode === "live"
+                        ? "simulação (velas)"
+                        : "backtest (QuestDB)"
+                    }`
+                  : backtestOverlayMode === "live"
+                    ? "Simulação (velas do gráfico)"
+                    : "Backtest (vectorbt / QuestDB)"}
+              </span>
+              <span className="shrink-0 text-zinc-500" title="B/S nas velas; equity no painel por baixo">
+                B/S · equity
+              </span>
+              <span className="text-zinc-500">
+                retorno{" "}
+                <span
+                  className="font-semibold tabular-nums text-zinc-200"
+                  style={{
+                    color: backtestChart.stats.return_pct >= 0 ? "#4ade80" : "#f87171",
+                  }}
+                >
+                  {backtestChart.stats.return_pct >= 0 ? "+" : ""}
+                  {backtestChart.stats.return_pct.toFixed(2)}%
+                </span>
+              </span>
+              <span className="text-zinc-500">
+                win{" "}
+                <span className="font-semibold tabular-nums text-zinc-200">
+                  {backtestChart.stats.win_rate.toFixed(1)}%
+                </span>
+              </span>
+              <span className="text-zinc-500">
+                trades{" "}
+                <span className="font-semibold tabular-nums text-zinc-200">
+                  {backtestChart.stats.trades}
+                </span>
+              </span>
+              <span className="text-zinc-500">
+                max DD{" "}
+                <span className="font-semibold tabular-nums text-rose-300/90">
+                  {backtestChart.stats.max_dd.toFixed(2)}%
+                </span>
+              </span>
+              <span className="text-zinc-500">
+                Sharpe{" "}
+                <span className="font-semibold tabular-nums text-zinc-200">
+                  {backtestChart.stats.sharpe.toFixed(2)}
+                </span>
+              </span>
+              <span className="text-zinc-500">
+                profit factor{" "}
+                <span className="font-semibold tabular-nums text-zinc-200">
+                  {backtestChart.stats.profit_fct.toFixed(2)}
+                </span>
+              </span>
+            </div>
+          </div>
+        ) : null}
         {crosshairHud ? (
           <div
             className="pointer-events-none absolute left-2 top-2 z-30 max-w-[calc(100%-1rem)] rounded-md border border-zinc-700/50 bg-[#0a0a0c]/93 px-2.5 py-2 shadow-lg backdrop-blur-sm"
@@ -1500,6 +3027,161 @@ export function OhlcvChart({
             </div>
           </div>
         ) : null}
+        {showStudyChrome ? (
+          <div
+            ref={studyChromeStackRef}
+            className="flex shrink-0 flex-col border-b border-zinc-800/70 bg-[#050506] shadow-[inset_0_-1px_0_0_rgba(255,255,255,0.03)]"
+          >
+            {showRsiPane ? (
+              <div
+                className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 px-2.5 py-1"
+                style={{ minHeight: RSI_STUDY_HEADER_PX }}
+              >
+                {visibleRsiDefs.length === 0 ? (
+                  <span className="text-xs font-semibold tracking-tight text-zinc-500">Estudos</span>
+                ) : (
+                  visibleRsiDefs.map((d) => {
+                    const fn = d.talibFunction?.toUpperCase() ?? "TA-LIB";
+                    const tp = d.talibParams?.timeperiod;
+                    const c = d.color ?? "#38bdf8";
+                    const lab = d.label?.trim() || fn;
+                    const sub =
+                      tp != null && Number.isFinite(tp) ? String(tp) : fn;
+                    return (
+                      <span
+                        key={d.id}
+                        className="inline-flex items-baseline gap-1 text-xs font-semibold tracking-tight"
+                        style={{ color: c }}
+                      >
+                        <span className="truncate">{lab}</span>
+                        <span className="text-[10px] font-medium text-zinc-500">{sub}</span>
+                      </span>
+                    );
+                  })
+                )}
+              </div>
+            ) : null}
+            {showMacdPane ? (
+              <div
+                className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-t border-zinc-800/50 px-2.5 py-1"
+                style={{ minHeight: RSI_STUDY_HEADER_PX }}
+              >
+                {visibleMacdDefs.length === 0 ? (
+                  <span className="text-xs font-semibold tracking-tight text-zinc-500">MACD</span>
+                ) : (
+                  visibleMacdDefs.map((d) => {
+                    const c = d.color ?? "#22d3ee";
+                    const lab = d.label?.trim() || "MACD";
+                    if (d.kind === "talib") {
+                      const fn = d.talibFunction?.toUpperCase() ?? "MACD";
+                      return (
+                        <span
+                          key={d.id}
+                          className="inline-flex items-baseline gap-1 text-xs font-semibold tracking-tight"
+                          style={{ color: c }}
+                        >
+                          <span className="truncate">{lab}</span>
+                          <span className="text-[10px] font-medium text-zinc-500">{fn}</span>
+                        </span>
+                      );
+                    }
+                    const f = d.fast ?? 12;
+                    const s = d.slow ?? 26;
+                    const g = d.signal ?? 9;
+                    return (
+                      <span
+                        key={d.id}
+                        className="inline-flex items-baseline gap-1 text-xs font-semibold tracking-tight"
+                        style={{ color: c }}
+                      >
+                        <span className="truncate">{lab}</span>
+                        <span className="text-[10px] font-medium text-zinc-500">
+                          {f}/{s}/{g}
+                        </span>
+                      </span>
+                    );
+                  })
+                )}
+              </div>
+            ) : null}
+            {showDerivedStudyPane ? (
+              <div
+                className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-t border-zinc-800/50 px-2.5 py-1"
+                style={{ minHeight: RSI_STUDY_HEADER_PX }}
+              >
+                {visibleDerivedStudyDefs.map((d) => {
+                  const c = d.color ?? "#f472b6";
+                  const lab = d.label?.trim() || d.id;
+                  const sub =
+                    d.derived?.mode === "formula"
+                      ? d.derived.formula
+                      : `${d.derived?.transform?.toUpperCase() ?? "DER"}(${d.derived?.inputRef ?? "close"})`;
+                  return (
+                    <span
+                      key={`derived-study-${d.id}`}
+                      className="inline-flex min-w-0 items-baseline gap-1 text-xs font-semibold tracking-tight"
+                      style={{ color: c }}
+                    >
+                      <span className="truncate">{lab}</span>
+                      <span className="truncate text-[10px] font-medium text-zinc-500">{sub}</span>
+                    </span>
+                  );
+                })}
+              </div>
+            ) : null}
+            {showDeltaPane ? (
+              <div
+                className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-t border-zinc-800/50 px-2.5 py-1"
+                style={{ minHeight: RSI_STUDY_HEADER_PX }}
+              >
+                {visibleDeltaStudyDefs.length === 0 ? (
+                  <span className="text-xs font-semibold tracking-tight text-zinc-500">Δ</span>
+                ) : (
+                  visibleDeltaStudyDefs.map((d) => {
+                    const lb = effectiveDeltaLookbackBars(d);
+                    const n = effectiveDeltaNormalizeByPrice(d);
+                    const sub = n ? `Δ${lb} ÷ fecho` : `Δ${lb}`;
+                    const lab = d.label?.trim() || d.id;
+                    const col = d.color ?? "#94a3b8";
+                    return (
+                      <span
+                        key={`dlt-${d.id}`}
+                        className="inline-flex items-baseline gap-1 text-xs font-semibold tracking-tight"
+                        style={{ color: col }}
+                      >
+                        <span className="truncate">{lab}</span>
+                        <span className="text-[10px] font-medium tabular-nums text-zinc-500">{sub}</span>
+                      </span>
+                    );
+                  })
+                )}
+              </div>
+            ) : null}
+            {showFeatPane ? (
+              <div
+                className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-t border-zinc-800/50 px-2.5 py-1"
+                style={{ minHeight: RSI_STUDY_HEADER_PX }}
+              >
+                {visibleFeatEntries.length === 0 ? (
+                  <span className="text-xs font-semibold tracking-tight text-zinc-500">QuestDB</span>
+                ) : (
+                  visibleFeatEntries.map((e) => (
+                    <span
+                      key={e.id}
+                      className="inline-flex items-baseline gap-1 text-xs font-semibold tracking-tight"
+                      style={{ color: e.color }}
+                    >
+                      <span className="truncate">{e.label}</span>
+                      <span className="font-mono text-[10px] font-medium tabular-nums text-zinc-500">
+                        {e.id}
+                      </span>
+                    </span>
+                  ))
+                )}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         <div className="relative flex min-h-0 w-full min-w-0 flex-1 flex-col">
           <div ref={mainWrapRef} className="min-h-0 w-full min-w-0 flex-1" />
           {liveSnapshot && liveSnapshot.ticks.length > 0 ? (
@@ -1535,50 +3217,6 @@ export function OhlcvChart({
             </button>
           </div>
         </div>
-        {showRsiPane ? (
-          <div ref={rsiStackRef} className="flex shrink-0 flex-col">
-            <div
-              className="flex shrink-0 items-center border-y border-zinc-800/80 bg-[#030304] px-2 text-[10px] tabular-nums text-zinc-500"
-              style={{ height: TIME_RULER_ROW_PX, paddingRight: "52px" }}
-              aria-hidden
-            >
-              <span className="min-w-0 flex-1 truncate text-zinc-400">{timeStrip.from || "—"}</span>
-              <span className="mx-2 shrink-0 text-zinc-600">·</span>
-              <span className="min-w-0 flex-1 truncate text-right text-zinc-400">{timeStrip.to || "—"}</span>
-            </div>
-            <div className="flex shrink-0 flex-col border-t border-zinc-800/70 bg-[#050506] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.03)]">
-              <div
-                className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-zinc-800/90 px-2.5 py-1"
-                style={{ minHeight: RSI_STUDY_HEADER_PX }}
-              >
-                {visibleRsiDefs.length === 0 ? (
-                  <span className="text-xs font-semibold tracking-tight text-zinc-500">RSI</span>
-                ) : (
-                  visibleRsiDefs.map((d) => {
-                    const period = d.period ?? 14;
-                    const c = effectiveRsiLineColor(d.id, d.color);
-                    const lab = d.label?.trim() || "RSI";
-                    return (
-                      <span
-                        key={d.id}
-                        className="inline-flex items-baseline gap-1 text-xs font-semibold tracking-tight"
-                        style={{ color: c }}
-                      >
-                        <span className="truncate">{lab}</span>
-                        <span className="text-[10px] font-medium text-zinc-500">{period}</span>
-                      </span>
-                    );
-                  })
-                )}
-              </div>
-              <div
-                ref={rsiPlotWrapRef}
-                className="shrink-0"
-                style={{ height: RSI_PLOT_HEIGHT_PX }}
-              />
-            </div>
-          </div>
-        ) : null}
         <p className="sr-only">
           Gráficos: Lightweight Charts (TradingView).{" "}
           <a href="https://www.tradingview.com/" className="underline">

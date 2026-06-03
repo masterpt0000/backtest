@@ -1,6 +1,7 @@
 {
   "id": "minimal",
-  "name": "Mínima",
+  "name": "Mínima (teste RSI 30→long, 50→sair, 70→short)",
+  "vbt_strategy": "minimal_rsi_stairs",
   "indicators": [
     {
       "id": "ema21",

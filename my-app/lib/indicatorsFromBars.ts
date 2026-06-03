@@ -127,3 +127,33 @@ export function rsiSeries(bars: BarClose[], period: number): LinePoint[] {
   }
   return out;
 }
+
+/**
+ * Uma barra alinhada a ``closes`` — mesmo Wilder que ``rsiSeries`` (para sinais / simulação no cliente).
+ */
+export function rsiCloseWilderArray(closes: number[], period: number): (number | undefined)[] {
+  const n = closes.length;
+  const rsiVals: (number | undefined)[] = new Array(n);
+  if (n < period + 1) return rsiVals;
+  let avgG = 0;
+  let avgL = 0;
+  for (let i = 1; i <= period; i++) {
+    const ch = closes[i] - closes[i - 1];
+    if (ch >= 0) avgG += ch;
+    else avgL -= ch;
+  }
+  avgG /= period;
+  avgL /= period;
+  const rs0 = avgL === 0 ? 100 : avgG / avgL;
+  rsiVals[period] = 100 - 100 / (1 + rs0);
+  for (let i = period + 1; i < n; i++) {
+    const ch = closes[i] - closes[i - 1];
+    const g = ch > 0 ? ch : 0;
+    const l = ch < 0 ? -ch : 0;
+    avgG = (avgG * (period - 1) + g) / period;
+    avgL = (avgL * (period - 1) + l) / period;
+    const rs = avgL === 0 ? 100 : avgG / avgL;
+    rsiVals[i] = 100 - 100 / (1 + rs);
+  }
+  return rsiVals;
+}

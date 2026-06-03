@@ -115,19 +115,26 @@ def build_candles_backward_query(
     before_ms: float | int,
     limit: int,
     ts_col: str | None = None,
+    *,
+    bar_cap: int | None = None,
 ) -> tuple[str, str]:
     if timeframe not in TIMEFRAME_TO_SAMPLE:
         raise ValueError(f"timeframe inválido: {timeframe}")
     sample = TIMEFRAME_TO_SAMPLE[timeframe]
     col = ts_col if ts_col is not None else candles_ts_column()
     t_before = ts_iso(before_ms)
-    lim = min(MAX_POINTS_CAP, max(1, int(limit)))
+    cap = int(bar_cap) if bar_cap is not None else MAX_POINTS_CAP
+    cap = max(1, cap)
+    lim = min(cap, max(1, int(limit)))
 
     if sample is None:
         inner = (
-            f"SELECT {col}, open, high, low, close, volume "
+            f"SELECT {col}, "
+            f"first(open) AS open, max(high) AS high, min(low) AS low, "
+            f"last(close) AS close, last(volume) AS volume "
             f"FROM candles_1m "
             f"WHERE symbol_id = {symbol_id} AND {col} < '{t_before}' "
+            f"SAMPLE BY 1m ALIGN TO CALENDAR "
             f"ORDER BY {col} DESC "
             f"LIMIT {lim}"
         )
@@ -144,6 +151,52 @@ def build_candles_backward_query(
         f"LIMIT {lim}"
     )
     return (sample, f"SELECT * FROM ({inner}) x ORDER BY 1 ASC")
+
+
+def build_candles_range_query(
+    symbol_id: int,
+    timeframe: str,
+    from_ms: float | int,
+    to_ms: float | int,
+    limit: int,
+    ts_col: str | None = None,
+    *,
+    bar_cap: int | None = None,
+) -> tuple[str, str]:
+    if timeframe not in TIMEFRAME_TO_SAMPLE:
+        raise ValueError(f"timeframe inválido: {timeframe}")
+    sample = TIMEFRAME_TO_SAMPLE[timeframe]
+    col = ts_col if ts_col is not None else candles_ts_column()
+    t_from = ts_iso(from_ms)
+    t_to = ts_iso(to_ms)
+    cap = int(bar_cap) if bar_cap is not None else MAX_POINTS_CAP
+    cap = max(1, cap)
+    lim = min(cap, max(1, int(limit)))
+
+    if sample is None:
+        sql = (
+            f"SELECT {col}, "
+            f"first(open) AS open, max(high) AS high, min(low) AS low, "
+            f"last(close) AS close, last(volume) AS volume "
+            f"FROM candles_1m "
+            f"WHERE symbol_id = {symbol_id} AND {col} >= '{t_from}' AND {col} < '{t_to}' "
+            f"SAMPLE BY 1m ALIGN TO CALENDAR "
+            f"ORDER BY {col} ASC "
+            f"LIMIT {lim}"
+        )
+        return ("1m", sql)
+
+    sql = (
+        f"SELECT {col}, "
+        f"first(open) AS open, max(high) AS high, min(low) AS low, "
+        f"last(close) AS close, sum(volume) AS volume "
+        f"FROM candles_1m "
+        f"WHERE symbol_id = {symbol_id} AND {col} >= '{t_from}' AND {col} < '{t_to}' "
+        f"SAMPLE BY {sample} ALIGN TO CALENDAR "
+        f"ORDER BY {col} ASC "
+        f"LIMIT {lim}"
+    )
+    return (sample, sql)
 
 
 def rows_to_bars(rows: list[dict[str, Any]], ts_col: str) -> list[dict[str, Any]]:

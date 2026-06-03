@@ -1,0 +1,47 @@
+{
+  "id": "feat_quest_funding_snap",
+  "name": "Feat funding + mark (heurística)",
+  "isBuilderStrategy": true,
+  "builderSpec": {
+    "version": 1,
+    "name": "Funding extremo + mesma base tape+livro",
+    "indicators": [
+      {
+        "id": "t_anchor",
+        "label": "EMA 21",
+        "group": "overlays",
+        "kind": "talib",
+        "params": {
+          "talibFunction": "EMA",
+          "talibParams": { "timeperiod": 21 },
+          "source": "close"
+        }
+      }
+    ],
+    "rules": {
+      "filterIf": null,
+      "filter": null,
+      "zoneLongIf": null,
+      "zoneLong": null,
+      "zoneLongWaitCandles": 10,
+      "zoneShortIf": null,
+      "zoneShort": null,
+      "zoneShortWaitCandles": 10,
+      "long": {
+        "applyFilter": false,
+        "ifLine": "feat_funding_rate < -0.00005 and feat_tick_imbalance > 0.1 and feat_ob_imb_snap > 0.02",
+        "expr": null
+      },
+      "short": {
+        "applyFilter": false,
+        "ifLine": "feat_funding_rate > 0.00005 and feat_tick_imbalance < -0.1 and feat_ob_imb_snap < -0.02",
+        "expr": null
+      },
+      "exitLongIf": "feat_tick_imbalance < 0 or feat_ob_imb_snap < -0.05",
+      "exitShortIf": "feat_tick_imbalance > 0 or feat_ob_imb_snap > 0.05",
+      "exitLong": null,
+      "exitShort": null
+    },
+    "risk": { "takeProfitPct": 1.8, "stopLossPct": 0.9 }
+  }
+}

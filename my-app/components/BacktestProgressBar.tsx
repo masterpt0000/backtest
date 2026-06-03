@@ -3,6 +3,7 @@
 import Link from "next/link";
 
 import { useBacktestJob } from "@/components/BacktestJobProvider";
+import { formatBacktestTimeframeLabel } from "@/lib/backtestTypes";
 
 export function BacktestProgressBar() {
   const { status, progress, phase, run, error, cancelBacktest, dismissCompleted } =
@@ -30,7 +31,9 @@ export function BacktestProgressBar() {
             <span className="text-xs font-medium text-zinc-300">{label}</span>
             {run ? (
               <span className="truncate text-[11px] text-zinc-500">
-                {run.vbt_label ?? run.vbt_strategy} · {run.timeframe} · {run.mode === "optimize" ? "optimização" : `${run.num_tests} testes`} · {run.symbol_ids.length} par(es)
+                {run.vbt_label ?? run.vbt_strategy} · {formatBacktestTimeframeLabel(run)} ·{" "}
+                {run.mode === "optimize" ? "optimização" : `${run.num_tests} testes`} · {run.symbol_ids.length}{" "}
+                par(es)
               </span>
             ) : null}
           </div>

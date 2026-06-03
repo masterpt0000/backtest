@@ -1,0 +1,21 @@
+{
+  "id": "ema_cross_long_only",
+  "name": "Teste — EMA cross long only (9/21)",
+  "vbt_strategy": "ema_cross_long_only",
+  "indicators": [
+    {
+      "id": "ema_fast",
+      "label": "EMA 9",
+      "group": "overlays",
+      "kind": "ema",
+      "params": { "period": 9 }
+    },
+    {
+      "id": "ema_slow",
+      "label": "EMA 21",
+      "group": "overlays",
+      "kind": "ema",
+      "params": { "period": 21 }
+    }
+  ]
+}
